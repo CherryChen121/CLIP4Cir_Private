@@ -1,0 +1,117 @@
+unset http_proxy
+unset https_proxy
+unset all_proxy
+
+
+cd /data0/qrchen/projects/CLIP4Cir
+conda activate clip4cir
+find . -type d -name "__pycache__" -exec rm -rf {} +
+
+python src/combiner_train.py \
+   --dataset FashionIQ \
+   --dress-types CH CO NM RB RCH UM \
+   --num-epochs 1 \
+   --clip-model-name RN50x4 \
+   --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/clip_rn50x4_fullft.pt \
+   --batch-size 128 \
+   --clip-bs 16 \
+   --save-training
+
+python src/combiner_train.py \
+    --dataset FashionIQ \
+    --dress-types CH CO NM RB RCH UM \
+    --num-epochs 1 \
+    --clip-model-name RetiZero \
+    --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth \
+    --batch-size 128 \
+    --clip-bs 16 \
+    --save-training
+
+pkill -9 python
+
+
+
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py \
+    --dataset FashionIQ \
+    --dress-types CH CO NM RB RCH UM \
+    --projection-dim 2560 \
+    --hidden-dim 5120 \
+    --num-epochs 150 \
+    --clip-model-name RN50x4 \
+    --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/tuned_clip_best.pt \
+    --combiner-lr 2e-5 \
+    --batch-size 128 \
+    --clip-bs 16 \
+    --transform targetpad \
+    --target-ratio 1.25 \
+    --save-training \
+    --save-best \
+    --validation-frequency 5 > run1_150epochs.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup bash -c "\
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 2560 --hidden-dim 5120 --num-epochs 150 --clip-model-name RN50x4 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/tuned_clip_best.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_150epochs.log 2>&1 && \
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 2560 --hidden-dim 5120 --num-epochs 150 --clip-model-name RN50x4 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/tuned_clip_best.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run2_150epochs.log 2>&1 && \
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 2560 --hidden-dim 5120 --num-epochs 150 --clip-model-name RN50x4 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/tuned_clip_best.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run3_150epochs.log 2>&1 && \
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 2560 --hidden-dim 5120 --num-epochs 150 --clip-model-name RN50x4 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/tuned_clip_best.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run4_150epochs.log 2>&1 && \
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 2560 --hidden-dim 5120 --num-epochs 150 --clip-model-name RN50x4 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/tuned_clip_best.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run5_150epochs.log 2>&1" > chain_status.log 2>&1 &
+
+
+
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py \
+    --dataset FashionIQ \
+    --dress-types CH CO NM RB RCH UM \
+    --projection-dim 512 \
+    --hidden-dim 1024 \
+    --num-epochs 150 \
+    --clip-model-name RetiZero \
+    --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth \
+    --combiner-lr 1e-5 \
+    --batch-size 256 \
+    --clip-bs 128 \
+    --transform targetpad \
+    --target-ratio 1.25 \
+    --save-training \
+    --save-best \
+    --validation-frequency 5 > run1_retizero.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup bash -c "\
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --combiner-lr 1e-5 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_retizero.log 2>&1 && \
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --combiner-lr 1e-5 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run2_retizero.log 2>&1 && \
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --combiner-lr 1e-5 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run3_retizero.log 2>&1 && \
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --combiner-lr 1e-5 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run4_retizero.log 2>&1 && \
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --combiner-lr 1e-5 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run5_retizero.log 2>&1" > chain_status_retizero.log 2>&1 &
+
+
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 python src/clip_fine_tune.py \
+   --dataset FashionIQ \
+   --num-epochs 4 \
+   --clip-model-name RN50x4 \
+   --encoder both \
+   --learning-rate 2e-6 \
+   --batch-size 256 \
+   --transform targetpad \
+   --target-ratio 1.25 \
+   --validation-frequency 2 \
+   --save-training > smoke_test.log 2>&1
+
+
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py \
+   --dataset FashionIQ \
+   --num-epochs 100 \
+   --clip-model-name RN50x4 \
+   --encoder both \
+   --learning-rate 2e-6 \
+   --batch-size 256 \
+   --transform targetpad \
+   --target-ratio 1.25 \
+   --save-training \
+   --save-best \
+   --validation-frequency 5 > CLIP_fine_tune_2.log 2>&1 &
+
+
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup bash -c "
+python src/clip_fine_tune.py --dataset FashionIQ --num-epochs 100 --clip-model-name RN50x4 --encoder both --learning-rate 2e-6 --batch-size 256 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > CLIP_2.log 2>&1 && \
+python src/clip_fine_tune.py --dataset FashionIQ --num-epochs 100 --clip-model-name RN50x4 --encoder both --learning-rate 2e-6 --batch-size 256 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > CLIP_3.log 2>&1 && \
+python src/clip_fine_tune.py --dataset FashionIQ --num-epochs 100 --clip-model-name RN50x4 --encoder both --learning-rate 2e-6 --batch-size 256 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > CLIP_4.log 2>&1 && \
+python src/clip_fine_tune.py --dataset FashionIQ --num-epochs 100 --clip-model-name RN50x4 --encoder both --learning-rate 2e-6 --batch-size 256 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > CLIP_5.log 2>&1
+" > chain_status.log 2>&1 &
