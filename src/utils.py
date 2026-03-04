@@ -49,7 +49,7 @@ def extract_index_features(dataset, clip_model):
     index_features = None  
     index_names = []
     
-    classic_val_loader = DataLoader(dataset=dataset, batch_size=32, num_workers=4,
+    classic_val_loader = DataLoader(dataset=dataset, batch_size=32, num_workers=0,
                                     pin_memory=True, collate_fn=collate_fn)
 
     # 3. 提取特征

@@ -61,7 +61,7 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+    training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S") + f"_pid{os.getpid()}"
     training_path: Path = Path(
         base_path / f"models/combiner_trained_on_fiq_{clip_model_name}_{training_start}")
     training_path.mkdir(exist_ok=False, parents=True)
@@ -73,12 +73,14 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
 # === 模型加载逻辑对齐 ===
     if "RetiZero" in clip_model_name:
         print("🔧 正在初始化 RetiZero 适配器...")
-        # 建议改为这种写法，无论你在哪个目录运行都能兼容
         try:
             from src.retizero_adapter import RetiZeroAdapter
         except ImportError:
             from retizero_adapter import RetiZeroAdapter
-        model_path = kwargs.get("clip_model_path", "pretrained_models/RetiZero.pth")
+        # 优先使用 retizero_base_path 作为 base 权重路径
+        # 如果未指定，则回退到 clip_model_path（兼容旧用法）
+        model_path = kwargs.get("retizero_base_path") or \
+                     kwargs.get("clip_model_path", "pretrained_models/RetiZero.pth")
         
         # 1. 实例化适配器
         clip_model = RetiZeroAdapter(model_path).to(device)
@@ -144,13 +146,25 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
     if kwargs.get("clip_model_path"):
         print('Trying to load the CLIP model')
         
-        # 1. 自动检测模型身份：不管是变量名不对还是字符串大小写不对，只要类型对就行
+        # 1. 自动检测模型身份
         is_retizero = (kwargs.get("clip_model_name") == 'RetiZero') or \
                       (type(clip_model).__name__ == 'RetiZeroAdapter')
 
         if is_retizero:
-            print('✨ [Debug] 身份确认：RetiZero。')
-            print('✨ 权重已在初始化阶段完成加载，正在跳过外部冗余逻辑以防止报错。')
+            # 检查 clip_model_path 是否指向 LoRA 微调 checkpoint
+            clip_model_path = kwargs["clip_model_path"]
+            ckpt_probe = torch.load(clip_model_path, map_location='cpu')
+            is_lora_ckpt = 'state_dict' in ckpt_probe and any(
+                k.startswith('img_encoder.') for k in ckpt_probe.get('state_dict', {}).keys()
+            )
+            del ckpt_probe  # 释放内存
+
+            if is_lora_ckpt:
+                print('🔧 检测到 LoRA 微调 checkpoint，正在加载 vision encoder 权重...')
+                clip_model.load_lora_checkpoint(clip_model_path)
+            else:
+                print('✨ [Debug] 身份确认：RetiZero base 模型。')
+                print('✨ 权重已在初始化阶段完成加载，跳过冗余逻辑。')
         else:
             # 原有的加载逻辑，仅针对非 RetiZero 模型
             clip_model_path = kwargs["clip_model_path"]
@@ -162,7 +176,6 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
             if any(k.startswith("clip_model.") for k in clip_weights.keys()):
                 clip_model.load_state_dict(clip_weights)
             else:
-                # 这一步就是报错 166 行的来源：给键名加前缀
                 new_state_dict = {f"clip_model.{k}": v for k, v in clip_weights.items()}
                 clip_model.load_state_dict(new_state_dict)
             print('CLIP model loaded successfully')
@@ -218,6 +231,7 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
                                        drop_last=True, shuffle=True)
 
     optimizer = optim.Adam(combiner.parameters(), lr=combiner_lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
     crossentropy_criterion = nn.CrossEntropyLoss()
     scaler = torch.cuda.amp.GradScaler()
 
@@ -350,6 +364,8 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
 
             training_log_frame = pd.concat([training_log_frame, pd.DataFrame(data={'epoch': epoch, 'train_epoch_loss': train_epoch_loss}, index=[0])])
             training_log_frame.to_csv(str(training_path / 'train_metrics.csv'), index=False)
+
+        scheduler.step()
 
         # --- 验证阶段 (R@1, R@5, R@10 版) ---
         if epoch % validation_frequency == 0:
@@ -708,7 +724,9 @@ if __name__ == '__main__':
     parser.add_argument("--save-best", dest="save_best", action='store_true',
                         help="Save only the best model during training")
 
-    parser.add_argument("--dress-types", nargs='+', default=['shirt', 'dress', 'toptee'], help="fashionIQ categories")      ############################
+    parser.add_argument("--dress-types", nargs='+', default=['shirt', 'dress', 'toptee'], help="fashionIQ categories")
+    parser.add_argument("--retizero-base-path", type=str, default=None,
+                        help="Path to base RetiZero.pth (used when --clip-model-path is a LoRA checkpoint)")
 
     args = parser.parse_args()
     if args.dataset.lower() not in ['fashioniq', 'cirr']:
@@ -728,6 +746,7 @@ if __name__ == '__main__':
         "target_ratio": args.target_ratio,
         "save_training": args.save_training,
         "save_best": args.save_best,
+        "retizero_base_path": args.retizero_base_path,
     }
 
     if args.api_key and args.workspace:

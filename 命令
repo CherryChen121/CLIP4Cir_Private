@@ -115,3 +115,38 @@ python src/clip_fine_tune.py --dataset FashionIQ --num-epochs 100 --clip-model-n
 python src/clip_fine_tune.py --dataset FashionIQ --num-epochs 100 --clip-model-name RN50x4 --encoder both --learning-rate 2e-6 --batch-size 256 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > CLIP_4.log 2>&1 && \
 python src/clip_fine_tune.py --dataset FashionIQ --num-epochs 100 --clip-model-name RN50x4 --encoder both --learning-rate 2e-6 --batch-size 256 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > CLIP_5.log 2>&1
 " > chain_status.log 2>&1 &
+
+
+# ==============================================================
+# RetiZero LoRA (run3 best) + Combiner 训练
+# 使用 LoRA 微调后的 vision encoder 作为特征提取器
+# base 权重 → RetiZero.pth, LoRA checkpoint → run3/best_acc_0.9637.pth
+# ==============================================================
+
+# 单次运行 (调试用, lr=1e-4 + CosineAnnealingLR)
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py \
+    --dataset FashionIQ \
+    --dress-types CH CO NM RB RCH UM \
+    --projection-dim 512 \
+    --hidden-dim 1024 \
+    --num-epochs 150 \
+    --clip-model-name RetiZero \
+    --retizero-base-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth \
+    --clip-model-path /data0/qrchen/projects/RetiZero/Model_saved/run_20260228_130453_run3/best_acc_0.9637.pth \
+    --combiner-lr 1e-4 \
+    --batch-size 256 \
+    --clip-bs 128 \
+    --transform targetpad \
+    --target-ratio 1.25 \
+    --save-training \
+    --save-best \
+    --validation-frequency 2 > run1_retizero_lora_150_lr1e4_cos.log 2>&1 &
+
+# 5 次并行运行 (正式实验, lr=1e-4 + CosineAnnealingLR, 每张卡跑一个)
+# 说明: lr=1e-4 在150轮内峰值达到 24.71 (epoch145)，远超 lr=4e-5 的 ~20
+#       现已加入 CosineAnnealingLR (T_max=150, eta_min=1e-6)，防止末尾振荡
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --retizero-base-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --clip-model-path /data0/qrchen/projects/RetiZero/Model_saved/run_20260228_130453_run3/best_acc_0.9637.pth --combiner-lr 1e-4 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 2 > run1_retizero_lora_150_lr1e4_cos.log 2>&1 &
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --retizero-base-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --clip-model-path /data0/qrchen/projects/RetiZero/Model_saved/run_20260228_130453_run3/best_acc_0.9637.pth --combiner-lr 1e-4 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 2 > run2_retizero_lora_150_lr1e4_cos.log 2>&1 &
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --retizero-base-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --clip-model-path /data0/qrchen/projects/RetiZero/Model_saved/run_20260228_130453_run3/best_acc_0.9637.pth --combiner-lr 1e-4 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 2 > run3_retizero_lora_150_lr1e4_cos.log 2>&1 &
+CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --retizero-base-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --clip-model-path /data0/qrchen/projects/RetiZero/Model_saved/run_20260228_130453_run3/best_acc_0.9637.pth --combiner-lr 1e-4 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 2 > run4_retizero_lora_150_lr1e4_cos.log 2>&1 &
+CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --retizero-base-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --clip-model-path /data0/qrchen/projects/RetiZero/Model_saved/run_20260228_130453_run3/best_acc_0.9637.pth --combiner-lr 1e-4 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 2 > run5_retizero_lora_150_lr1e4_cos.log 2>&1 &
