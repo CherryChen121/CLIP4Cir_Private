@@ -1,299 +1,214 @@
-# CLIP4Cir (ACM TOMM 2023)
+# UWF Fundus CIR — CLIP4Cir & RetiZero on Ophthalmic Datasets
 
-### Composed Image Retrieval using Contrastive Learning and Task-oriented CLIP-based Features
+### Adapting Composed Image Retrieval for Ultra-Wide Field Fundus Disease Images
 
-[![arXiv](https://img.shields.io/badge/arXiv-Paper-<COLOR>.svg)](https://arxiv.org/abs/2308.11485)
-[![GitHub Stars](https://img.shields.io/github/stars/ABaldrati/CLIP4Cir?style=social)](https://github.com/ABaldrati/CLIP4Cir)
+---
 
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/composed-image-retrieval-using-contrastive/image-retrieval-on-fashion-iq)](https://paperswithcode.com/sota/image-retrieval-on-fashion-iq?p=composed-image-retrieval-using-contrastive)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/composed-image-retrieval-using-contrastive/image-retrieval-on-cirr)](https://paperswithcode.com/sota/image-retrieval-on-cirr?p=composed-image-retrieval-using-contrastive)
+## Overview
 
-This is the **official repository** for the [**paper**](https://arxiv.org/abs/2308.11485) "*Composed Image Retrieval using Contrastive Learning and Task-oriented CLIP-based Features*".
+This project adapts the **Composed Image Retrieval (CIR)** framework to the medical imaging domain. Specifically, we restructure an Ultra-Wide Field (UWF) fundus disease image dataset into the **FashionIQ format** and apply two backbone models — **CLIP (RN50x4)** and **RetiZero** — within the CLIP4Cir training pipeline (CLIP fine-tuning + Combiner network training). The primary evaluation metric is **average recall rate (Recall@1 and Recall@10)** across 6 fundus disease categories.
 
+### Source Projects
 
-## Citation
-If you make use of our work, please cite our paper:
-```bibtex
-@article{baldrati2023composed,
-  title={Composed Image Retrieval using Contrastive Learning and Task-oriented CLIP-based Features},
-  author={Baldrati, Alberto and Bertini, Marco and Uricchio, Tiberio and Bimbo, Alberto Del},
-  journal={ACM Transactions on Multimedia Computing, Communications and Applications},
-  publisher={ACM New York, NY}
-}
-```
+| Project | Description | GitHub |
+|---------|-------------|--------|
+| **CLIP4Cir** | Composed Image Retrieval using Contrastive Learning and Task-oriented CLIP-based Features (ACM TOMM 2023) | [ABaldrati/CLIP4Cir](https://github.com/ABaldrati/CLIP4Cir) |
+| **RetiZero** | Vision-language foundation model for fundus images, pre-trained on 400+ diseases | [LooKing9218/RetiZero](https://github.com/LooKing9218/RetiZero) |
 
-If you are interested in Composed Image Retrieval (CIR) take a look also a look to our most recent work:
-[**Zero-Shot Composed Image Retrieval with Textual Inversion (ICCV 2023)**](https://arxiv.org/abs/2303.15247)
-[![Repo](https://badgen.net/badge/icon/GitHub?icon=github&label)](https://github.com/miccunifi/SEARLE)
-```bibtex
-@misc{baldrati2023zeroshot,
-      title={Zero-Shot Composed Image Retrieval with Textual Inversion}, 
-      author={Alberto Baldrati and Lorenzo Agnolucci and Marco Bertini and Alberto Del Bimbo},
-      year={2023},
-      eprint={2303.15247},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV}
-}
-```
+---
 
-## About The Project
-
-### Abstract
-
-Given a query composed of a reference image and a relative caption, the Composed Image Retrieval goal is to retrieve 
-images visually similar to the reference one that integrates the modifications expressed by the caption. Given that 
-recent research has demonstrated the efficacy of large-scale vision and language pretrained (VLP) models in various 
-tasks, we rely on features from the OpenAI CLIP model to tackle the considered task. We initially perform a task-oriented 
-fine-tuning of both CLIP encoders using the element-wise sum of visual and textual features. Then, in the second stage, 
-we train a Combiner network that learns to combine the image-text features integrating the bimodal information and 
-providing combined features used to perform the retrieval. We use contrastive learning in both stages of training. 
-Starting from the bare CLIP features as a baseline, experimental results show that the task-oriented fine-tuning and 
-the carefully crafted Combiner network are highly effective and outperform more complex state-of-the-art approaches on 
-FashionIQ and CIRR, two popular and challenging datasets for composed image retrieval.
-
-
-### Composed image retrieval task
-
-![](images/cir-overview.png "Composed image retrieval overview")
-
-The left portion of the illustration depicts a specific case of composed image retrieval in the fashion domain, where
-the user imposes constraints on the character attribute of a t-shirt. Meanwhile, the right part showcases an example 
-where the user asks to alter objects and their cardinality within a real-life image.
-### CLIP task-oriented fine-tuning 
-
-![](images/clip-fine-tuning.png "CLIP task oriented fine-tuning")
-
-First stage of training. In this stage, we perform a task-oriented fine-tuning of CLIP encoders to reduce the mismatch 
-between the large-scale pre-training and the downstream task. We start by extracting the 
- image-text query features and combining them through an element-wise sum. We then employ a contrastive loss 
-to minimize the distance between combined features and target image features in the same triplet and maximize the 
-distance from the other images in the batch. We update the weights of both CLIP encoders.
-### Combiner training 
-
-![](images/combiner-training.png "Combiner training")
-
-Second stage of training. In this stage, we train from scratch a Combiner network that learns to fuse the multimodal 
-features extracted with CLIP encoders. We start by extracting the image-text query features using the fine-tuned 
-encoders, and we combine them using the Combiner network. We then employ a contrastive loss to minimize the distance 
-between combined features and target image features in the same triplet and maximize the distance from the other images 
-in the batch. We keep both CLIP encoders frozen while we only update the weights of the Combiner network.
-At inference time the fine-tuned encoders and the trained Combiner are used to produce an effective representation used 
-to query the database.
-
-### Combiner architecture
-
-![](images/Combiner-architecture.png "Combiner architecture overview")
-
-Architecture of the Combiner network $C_{\theta}$. It takes as input the multimodal query features and outputs a unified
-representation. $\sigma$ represents the sigmoid function. We denote the outputs of the first branch (1) as $\lambda$ 
-and $1 -\lambda$, while the output of the second branch (2) as $v$. The combined features are $\overline{\phi_q} = (1 - \lambda)* \overline{\psi_{I}}(I_q) + \lambda * \overline{\psi_{T}}(T_q) + v$
-
-## Getting Started
-
-To get a local copy up and running follow these simple steps.
-
-### Prerequisites
-
-We strongly recommend the use of the [**Anaconda**](https://www.anaconda.com/) package manager to avoid
-dependency/reproducibility problems.
-A conda installation guide for Linux systems can be
-found [here](https://docs.conda.io/projects/conda/en/latest/user-guide/install/linux.html)
-
-### Installation
-
-1. Clone the repo
-
-```sh
-git clone https://github.com/ABaldrati/CLIP4Cir
-```
-
-2. Install Python dependencies
-
-```sh
-conda create -n clip4cir -y python=3.8
-conda activate clip4cir
-conda install -y -c pytorch pytorch=1.11.0 torchvision=0.12.0
-conda install -y -c anaconda pandas=1.4.2
-pip install comet-ml==3.21.0
-pip install git+https://github.com/openai/CLIP.git
-```
-
-## Usage
-
-Here's a brief description of each file under the ```src/``` directory:
-
-For running the following scripts in a decent amount of time, it is **heavily** recommended to use a CUDA-capable GPU.
-It is also recommended to have a properly initialized Comet.ml account to have better logging of the metrics
-(all the metrics will also be logged on a csv file).
-
-* ```utils.py```: utils file
-* ```combiner.py```: Combiner model definition
-* ```data_utils.py```: dataset loading and preprocessing utils
-* ```clip_fine_tune.py```: CLIP task-oriented fine-tuning file
-* ```combiner_train.py```: Combiner training file
-* ```validate.py```: compute metrics on the validation sets
-* ```cirr_test_submission.py```: generate test prediction on cirr test set
-
-**N.B** The purpose of the code in this repo is to be as clear as possible. For this reason, it does not include some optimizations such as gradient checkpointing (when fine-tuning CLIP) and feature pre-computation (when training the Combiner network)
-
-### Data Preparation
-
-To properly work with the codebase FashionIQ and CIRR datasets should have the following structure:
+## Project Structure
 
 ```
-project_base_path
-└───  fashionIQ_dataset
-      └─── captions
-            | cap.dress.test.json
-            | cap.dress.train.json
-            | cap.dress.val.json
-            | ...
-            
-      └───  images
-            | B00006M009.jpg
-            | B00006M00B.jpg
-            | B00006M6IH.jpg
-            | ...
-            
-      └─── image_splits
-            | split.dress.test.json
-            | split.dress.train.json
-            | split.dress.val.json
-            | ...
-
-└───  cirr_dataset  
-       └─── train
-            └─── 0
-                | train-10108-0-img0.png
-                | train-10108-0-img1.png
-                | train-10108-1-img0.png
-                | ...
-                
-            └─── 1
-                | train-10056-0-img0.png
-                | train-10056-0-img1.png
-                | train-10056-1-img0.png
-                | ...
-                
-            ...
-            
-       └─── dev
-            | dev-0-0-img0.png
-            | dev-0-0-img1.png
-            | dev-0-1-img0.png
-            | ...
-       
-       └─── test1
-            | test1-0-0-img0.png
-            | test1-0-0-img1.png
-            | test1-0-1-img0.png 
-            | ...
-       
-       └─── cirr
-            └─── captions
-                | cap.rc2.test1.json
-                | cap.rc2.train.json
-                | cap.rc2.val.json
-                
-            └─── image_splits
-                | split.rc2.test1.json
-                | split.rc2.train.json
-                | split.rc2.val.json
+CLIP4Cir/
+├── src/
+│   ├── clip_fine_tune.py          # Stage 1: CLIP task-oriented fine-tuning
+│   ├── combiner_train.py          # Stage 2: Combiner network training
+│   ├── validate.py                # Validation metrics computation
+│   ├── data_utils.py              # Dataset loading (with UWF compatibility patches)
+│   ├── combiner.py                # Combiner network definition
+│   ├── retizero_adapter.py        # RetiZero → CLIP4Cir interface adapter
+│   ├── validate_retizero_lora.py  # Validation script for RetiZero+LoRA variant
+│   ├── utils.py                   # Utility functions
+│   └── cirr_test_submission.py    # (Original) CIRR test submission
+├── fashionIQ_dataset/             # UWF dataset restructured in FashionIQ format
+│   ├── captions/                  # Text descriptions per disease category
+│   ├── images/                    # UWF fundus images (.png / .jpg)
+│   └── image_splits/              # Train / val / test splits
+├── pretrained_models/
+│   └── fashionIQ/
+│       ├── tuned_clip_best.pt     # Fine-tuned CLIP checkpoint (RN50x4)
+│       └── RetiZero.pth           # Pre-trained RetiZero weights
+└── models/                        # Saved Combiner checkpoints per run
 ```
 
-### Pre-trained models
-We provide the pre-trained (both CLIP and Combiner network) checkpoint via [Google Drive](https://drive.google.com/drive/folders/1ny2hhzP8HZBnXhjvDEni8P8G4_inCNTv?usp=sharing) in case you don't have enough GPU resources
+---
 
-### CLIP fine-tuning
+## Dataset: UWF Fundus CIR
 
-To fine-tune the CLIP model on FashionIQ or CIRR dataset run the following command with the desired hyper-parameters:
+The original UWF fundus disease images are restructured into the **FashionIQ format**, treating disease categories as analogues of fashion item types. The 6 categories used are:
 
-```sh
-python src/clip_fine_tune.py \
-   --dataset {'CIRR' or 'FashionIQ'} \
-   --api-key {Comet-api-key} \
-   --workspace {Comet-workspace} \
-   --experiment-name {Comet-experiment-name} \
+| Abbreviation | Disease Category |
+|---|---|
+| **CH** | Choroidal Hemangioma |
+| **CO** | Choroidal Others |
+| **NM** | Normal (Myopia) |
+| **RB** | Retinal Breaks |
+| **RCH** | Retinal Choroidal |
+| **UM** | Uveal Melanoma |
+
+Each category has corresponding `captions/*.json`, `image_splits/*.json`, and images under `images/`, following the same directory structure expected by the original FashionIQ data loaders.
+
+### Data Loader Compatibility Patches (`data_utils.py`)
+
+Several modifications were made to handle domain-specific issues:
+
+- **Mixed image format support**: Auto-detection of `.png` / `.jpg` suffixes to handle heterogeneous image extensions.
+- **Missing image filtering**: Physical disk validation at dataset initialization to remove broken or absent image references from triplets and index sets.
+- **Extended category list**: Added UWF disease abbreviations (CH, CO, NM, RB, RCH, UM) alongside the original FashionIQ categories (dress, shirt, toptee).
+- **Text truncation**: Medical descriptions often exceed 77 tokens; enforced `truncate=True` in CLIP tokenizer to avoid runtime crashes.
+- **Dynamic batch alignment**: Inserted dynamic slicing logic in the Combiner's `combine_features` to resolve tensor shape mismatches across heterogeneous batches.
+
+---
+
+## Two-Stage Training Pipeline
+
+### Stage 1: CLIP Task-Oriented Fine-Tuning
+
+Fine-tune both CLIP image and text encoders on the UWF CIR triplets using contrastive loss (element-wise sum of visual + textual features).
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py \
+   --dataset FashionIQ \
+   --dress-types CH CO NM RB RCH UM \
    --num-epochs 100 \
    --clip-model-name RN50x4 \
    --encoder both \
    --learning-rate 2e-6 \
    --batch-size 128 \
    --transform targetpad \
-   --target-ratio 1.25  \
-   --save-training \
-   --save-best \
-   --validation-frequency 1 
-```
-
-### Combiner training
-
-To train the Combiner model on FashionIQ or CIRR dataset run the following command with the desired hyper-parameters:
-
-```sh
-python src/combiner_train.py \
-   --dataset {'CIRR' or 'FashionIQ'} \
-   --api-key {Comet-api-key} \
-   --workspace {Comet-workspace} \
-   --experiment-name {Comet-experiment-name} \
-   --projection-dim 2560 \
-   --hidden-dim 5120 \
-   --num-epochs 300 \
-   --clip-model-name RN50x4 \
-   --clip-model-path {path-to-fine-tuned-CLIP} \
-   --combiner-lr 2e-5 \
-   --batch-size 4096 \
-   --clip-bs 32 \
-   --transform targetpad \
    --target-ratio 1.25 \
    --save-training \
    --save-best \
-   --validation-frequency 1
+   --validation-frequency 1 > clip_finetune.log 2>&1 &
 ```
 
-### Validation
+### Stage 2: Combiner Network Training
 
-To compute the metrics on the validation set run the following command
+Train the Combiner network on top of fixed (frozen) encoder features. Supports both CLIP (RN50x4) and RetiZero as backbone.
 
-```shell
-python src/validate.py 
-   --dataset {'CIRR' or 'FashionIQ'} \
-   --combining-function {'combiner' or 'sum'} \
-   --combiner-path {path to trained Combiner} \
+**CLIP backbone:**
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py \
+    --dataset FashionIQ \
+    --dress-types CH CO NM RB RCH UM \
+    --projection-dim 2560 \
+    --hidden-dim 5120 \
+    --num-epochs 150 \
+    --clip-model-name RN50x4 \
+    --clip-model-path pretrained_models/fashionIQ/tuned_clip_best.pt \
+    --combiner-lr 2e-5 \
+    --batch-size 128 \
+    --clip-bs 16 \
+    --transform targetpad \
+    --target-ratio 1.25 \
+    --save-training \
+    --save-best \
+    --validation-frequency 5 > combiner_clip.log 2>&1 &
+```
+
+**RetiZero backbone:**
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py \
+    --dataset FashionIQ \
+    --dress-types CH CO NM RB RCH UM \
+    --projection-dim 2560 \
+    --hidden-dim 5120 \
+    --num-epochs 150 \
+    --clip-model-name RetiZero \
+    --clip-model-path pretrained_models/fashionIQ/RetiZero.pth \
+    --combiner-lr 2e-5 \
+    --batch-size 128 \
+    --clip-bs 16 \
+    --transform targetpad \
+    --target-ratio 1.25 \
+    --save-training \
+    --save-best \
+    --validation-frequency 5 > combiner_retizero.log 2>&1 &
+```
+
+---
+
+## RetiZero Integration
+
+RetiZero is a fundus-specific vision-language model pre-trained on 341,896 fundus images covering 400+ diseases. To plug it into the CLIP4Cir Combiner training pipeline, a wrapper adapter (`src/retizero_adapter.py`) was implemented that:
+
+- Exposes `encode_image()` and `encode_text()` interfaces compatible with CLIP4Cir's feature extraction calls.
+- Mounts a `.visual` attribute with `input_resolution=224` and `output_dim=512` to satisfy internal interface checks.
+- Loads a local Bio_ClinicalBERT tokenizer for text encoding (offline mode to avoid network dependency).
+- Applies token truncation at `max_length=77` to align with CLIP's token limit.
+- Supports LoRA checkpoint loading for lightweight fine-tuning evaluation via `validate_retizero_lora.py`.
+
+---
+
+## Validation
+
+Compute Recall@1 and Recall@10 per category and overall average recall:
+
+```bash
+# CLIP backbone
+python src/validate.py \
+   --dataset FashionIQ \
+   --dress-types CH CO NM RB RCH UM \
+   --combining-function combiner \
+   --combiner-path models/<combiner_run>/best_combiner.pth \
    --projection-dim 2560 \
    --hidden-dim 5120 \
    --clip-model-name RN50x4 \
-   --clip-model-path {path-to-fine-tuned-CLIP} \
+   --clip-model-path pretrained_models/fashionIQ/tuned_clip_best.pt \
    --target-ratio 1.25 \
    --transform targetpad
+
+# RetiZero backbone
+python src/validate_retizero_lora.py \
+    --model-paths models/<retizero_run>/best_acc_*.pth \
+    --base-weight-path pretrained_models/fashionIQ/RetiZero.pth \
+    --output-csv results_retizero.csv
 ```
 
-### Test
+---
 
-To generate the prediction files to be submitted on CIRR evaluation server run the following command:
+## Key Code Modifications Summary
 
-```shell
-python src/cirr_test_submission.py 
-   --submission-name {file name of the submission} \
-   --combining-function {'combiner' or 'sum'} \
-   --combiner-path {path to trained Combiner} \
-   --projection-dim 2560 \
-   --hidden-dim 5120 \
-   --clip-model-name RN50x4 \
-   --clip-model-path {path-to-fine-tuned-CLIP} \
-   --target-ratio 1.25 \
-   --transform targetpad
+| # | File | Modification |
+|---|------|-------------|
+| 001 | `data_utils.py` | Dual-extension auto-detection (.png/.jpg), missing image filtering, UWF category support |
+| 027 | `validate.py` | Added `truncate=True` to CLIP tokenizer for long medical text |
+| 030 | `combiner_train.py` | Dynamic tensor slicing to fix batch size mismatches |
+| 037 | `combiner_train.py` | `nn.DataParallel` wrapping for multi-GPU training |
+| — | `retizero_adapter.py` | Full CLIP-interface adapter for RetiZero model |
+| — | `validate_retizero_lora.py` | Standalone validation pipeline for RetiZero+LoRA |
+
+---
+
+## Environment Setup
+
+```bash
+conda create -n clip4cir -y python=3.8
+conda activate clip4cir
+conda install -y -c pytorch pytorch=1.11.0 torchvision=0.12.0
+conda install -y -c anaconda pandas=1.4.2
+pip install comet-ml==3.21.0
+pip install git+https://github.com/openai/CLIP.git
+pip install transformers
 ```
 
-
-## Authors
-
-* [**Alberto Baldrati**](https://scholar.google.it/citations?hl=en&user=I1jaZecAAAAJ)
-* [**Marco Bertini**](https://scholar.google.it/citations?user=SBm9ZpYAAAAJ&hl=en)
-* [**Tiberio Uricchio**](https://scholar.google.it/citations?user=XHZLRdYAAAAJ&hl=en)
-* [**Alberto Del Bimbo**](https://scholar.google.it/citations?user=bf2ZrFcAAAAJ&hl=en)
+---
 
 ## Acknowledgements
 
-This work was partially supported by the European Commission under European Horizon 2020 Programme, grant number 101004545 - ReInHerit.
+- **CLIP4Cir** (ACM TOMM 2023): Alberto Baldrati et al. — [https://github.com/ABaldrati/CLIP4Cir](https://github.com/ABaldrati/CLIP4Cir)
+- **RetiZero**: LooKing9218 et al. — [https://github.com/LooKing9218/RetiZero](https://github.com/LooKing9218/RetiZero)
 
