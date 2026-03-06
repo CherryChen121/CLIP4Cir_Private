@@ -7,25 +7,7 @@ cd /data0/qrchen/projects/CLIP4Cir
 conda activate clip4cir
 find . -type d -name "__pycache__" -exec rm -rf {} +
 
-python src/combiner_train.py \
-   --dataset FashionIQ \
-   --dress-types CH CO NM RB RCH UM \
-   --num-epochs 1 \
-   --clip-model-name RN50x4 \
-   --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/clip_rn50x4_fullft.pt \
-   --batch-size 128 \
-   --clip-bs 16 \
-   --save-training
 
-python src/combiner_train.py \
-    --dataset FashionIQ \
-    --dress-types CH CO NM RB RCH UM \
-    --num-epochs 1 \
-    --clip-model-name RetiZero \
-    --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth \
-    --batch-size 128 \
-    --clip-bs 16 \
-    --save-training
 
 pkill -9 python
 
@@ -81,18 +63,6 @@ python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH U
 python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --combiner-lr 1e-5 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run4_retizero.log 2>&1 && \
 python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --combiner-lr 1e-5 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run5_retizero.log 2>&1" > chain_status_retizero.log 2>&1 &
 
-
-CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 python src/clip_fine_tune.py \
-   --dataset FashionIQ \
-   --num-epochs 4 \
-   --clip-model-name RN50x4 \
-   --encoder both \
-   --learning-rate 2e-6 \
-   --batch-size 256 \
-   --transform targetpad \
-   --target-ratio 1.25 \
-   --validation-frequency 2 \
-   --save-training > smoke_test.log 2>&1
 
 
 CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py \
@@ -150,3 +120,37 @@ CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --d
 CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --retizero-base-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --clip-model-path /data0/qrchen/projects/RetiZero/Model_saved/run_20260228_130453_run3/best_acc_0.9637.pth --combiner-lr 1e-4 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 2 > run3_retizero_lora_150_lr1e4_cos.log 2>&1 &
 CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --retizero-base-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --clip-model-path /data0/qrchen/projects/RetiZero/Model_saved/run_20260228_130453_run3/best_acc_0.9637.pth --combiner-lr 1e-4 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 2 > run4_retizero_lora_150_lr1e4_cos.log 2>&1 &
 CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --retizero-base-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/RetiZero.pth --clip-model-path /data0/qrchen/projects/RetiZero/Model_saved/run_20260228_130453_run3/best_acc_0.9637.pth --combiner-lr 1e-4 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 2 > run5_retizero_lora_150_lr1e4_cos.log 2>&1 &
+
+
+# ==============================================================
+# BMC_CLIP_CF (BIOMEDICA ViT-L/14) + Combiner 训练
+# 模型来源: BIOMEDICA/BMC_CLIP_CF (Hugging Face)
+# 架构: ViT-L/14, visual_dim=1024→proj→768, text_dim=768
+# feature_dim=768, Combiner 将自动使用 768 维
+# ==============================================================
+
+# 单次运行 (调试用)
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py \
+    --dataset FashionIQ \
+    --dress-types CH CO NM RB RCH UM \
+    --projection-dim 768 \
+    --hidden-dim 1536 \
+    --num-epochs 150 \
+    --clip-model-name ViT-L/14 \
+    --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/BMC_CLIP_CF.pt \
+    --combiner-lr 2e-5 \
+    --batch-size 128 \
+    --clip-bs 32 \
+    --transform targetpad \
+    --target-ratio 1.25 \
+    --save-training \
+    --save-best \
+    --validation-frequency 5 > run1_bmc_clip_cf.log 2>&1 &
+
+# 5 次串行运行 (正式实验)
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup bash -c "\
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 768 --hidden-dim 1536 --num-epochs 150 --clip-model-name ViT-L/14 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/BMC_CLIP_CF.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 32 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_bmc_clip_cf.log 2>&1 && \
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 768 --hidden-dim 1536 --num-epochs 150 --clip-model-name ViT-L/14 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/BMC_CLIP_CF.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 32 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run2_bmc_clip_cf.log 2>&1 && \
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 768 --hidden-dim 1536 --num-epochs 150 --clip-model-name ViT-L/14 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/BMC_CLIP_CF.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 32 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run3_bmc_clip_cf.log 2>&1 && \
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 768 --hidden-dim 1536 --num-epochs 150 --clip-model-name ViT-L/14 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/BMC_CLIP_CF.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 32 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run4_bmc_clip_cf.log 2>&1 && \
+python src/combiner_train.py --dataset FashionIQ --dress-types CH CO NM RB RCH UM --projection-dim 768 --hidden-dim 1536 --num-epochs 150 --clip-model-name ViT-L/14 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/fashionIQ/BMC_CLIP_CF.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 32 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run5_bmc_clip_cf.log 2>&1" > chain_status_bmc.log 2>&1 &

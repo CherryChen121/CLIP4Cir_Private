@@ -170,8 +170,17 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
             clip_model_path = kwargs["clip_model_path"]
             saved_state_dict = torch.load(clip_model_path, map_location=device)
             
-            # 兼容性处理：如果没有 "CLIP" 键就取全部
-            clip_weights = saved_state_dict["CLIP"] if "CLIP" in saved_state_dict else saved_state_dict
+            # 兼容性处理：优先取 "CLIP" 键，再取 "state_dict" 键，否则取全部
+            if "CLIP" in saved_state_dict:
+                clip_weights = saved_state_dict["CLIP"]
+            elif "state_dict" in saved_state_dict and isinstance(saved_state_dict["state_dict"], dict):
+                clip_weights = saved_state_dict["state_dict"]
+            else:
+                clip_weights = saved_state_dict
+            
+            # 去除 DataParallel/DDP 的 "module." 前缀
+            if any(k.startswith("module.") for k in clip_weights.keys()):
+                clip_weights = {k.replace("module.", "", 1): v for k, v in clip_weights.items()}
             
             if any(k.startswith("clip_model.") for k in clip_weights.keys()):
                 clip_model.load_state_dict(clip_weights)
