@@ -4,6 +4,7 @@ os.environ["COMET_LOGGING_CONSOLE"] = "info"
 from comet_ml import Experiment
 import json
 import multiprocessing
+import re
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
@@ -17,16 +18,95 @@ from torch import optim, nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from torchvision import transforms
+from torchvision.transforms.functional import InterpolationMode
 
-from data_utils import base_path, squarepad_transform, FashionIQDataset, targetpad_transform, CIRRDataset
+from data_utils import base_path, squarepad_transform, FashionIQDataset, targetpad_transform, CIRRDataset, SquarePad, TargetPad, ToClipTensor
 from combiner import Combiner
 from utils import collate_fn, update_train_running_results, set_train_bar_description, save_model, \
     extract_index_features, generate_randomized_fiq_caption, device
 from validate import compute_cirr_val_metrics, compute_fiq_val_metrics
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 print(f">>> 隔离校验：Torch 当前真实看到的显卡数量为: {torch.cuda.device_count()}")
 
-import torch.nn as nn
+
+def _dataloader_num_workers(default_workers: int = None) -> int:
+    env_value = os.environ.get("CLIP4CIR_NUM_WORKERS")
+    if env_value is not None:
+        return int(env_value)
+    if not torch.cuda.is_available():
+        return 0
+    return default_workers if default_workers is not None else multiprocessing.cpu_count()
+
+
+class _NullExperiment:
+    def train(self):
+        return self
+
+    def validate(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def set_name(self, *args, **kwargs):
+        pass
+
+    def log_code(self, *args, **kwargs):
+        pass
+
+    def log_parameters(self, *args, **kwargs):
+        pass
+
+    def log_metric(self, *args, **kwargs):
+        pass
+
+    def log_metrics(self, *args, **kwargs):
+        pass
+
+
+def _extract_state_dict_from_checkpoint(saved_state_dict):
+    if isinstance(saved_state_dict, dict) and "CLIP" in saved_state_dict:
+        return saved_state_dict["CLIP"]
+    if isinstance(saved_state_dict, dict) and "state_dict" in saved_state_dict and isinstance(saved_state_dict["state_dict"], dict):
+        return saved_state_dict["state_dict"]
+    if isinstance(saved_state_dict, dict):
+        return saved_state_dict
+    if hasattr(saved_state_dict, "state_dict"):
+        return saved_state_dict.state_dict()
+    return None
+
+
+def _safe_load_state_dict(model: nn.Module, state_dict: dict, *, context: str):
+    model_state = model.state_dict()
+    shape_mismatch = []
+    filtered_state = {}
+
+    for key, value in state_dict.items():
+        if key not in model_state:
+            continue
+        if model_state[key].shape != value.shape:
+            shape_mismatch.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+            continue
+        filtered_state[key] = value
+
+    if shape_mismatch:
+        preview = "\n".join(
+            f"  - {k}: ckpt={s1}, model={s2}" for k, s1, s2 in shape_mismatch[:10]
+        )
+        raise RuntimeError(
+            f"{context} 检测到参数维度不匹配，已中止加载。\n{preview}"
+        )
+
+    load_result = model.load_state_dict(filtered_state, strict=False)
+    print(
+        f"{context} loaded. matched_keys={len(filtered_state)}, "
+        f"missing_keys={len(load_result.missing_keys)}, unexpected_keys={len(load_result.unexpected_keys)}"
+    )
 
 class CLIPWrapper(nn.Module):
     def __init__(self, clip_model):
@@ -50,6 +130,92 @@ class CLIPWrapper(nn.Module):
             # 注意：这里必须使用 self._modules 字典直接访问，这是最安全的防递归写法
             return getattr(self._modules['clip_model'], name)
 
+
+def _is_blip_model_name(model_name: str) -> bool:
+    return "BLIP" in str(model_name).upper()
+
+
+def _safe_model_tag(model_name: str) -> str:
+    """Keep raw model name for clip.load, but use a filesystem-safe tag for run folders."""
+    name = str(model_name).strip()
+    known = {
+        "ViT-B/32": "vitb32",
+        "ViT-L/14": "vitl14",
+        "RN50x4": "rn50x4",
+    }
+    if name in known:
+        return known[name]
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
+    return normalized or "model"
+
+
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+def _build_eval_preprocess(
+    transform: str,
+    input_dim: int,
+    target_ratio: float,
+    clip_preprocess,
+    force_rgb: bool,
+    medical_mode: bool,
+    disable_targetpad_in_medical: bool,
+):
+    if transform == "clip":
+        return clip_preprocess
+    if transform == "squarepad":
+        return squarepad_transform(input_dim, force_rgb=force_rgb)
+    if transform == "targetpad":
+        use_targetpad = not (medical_mode and disable_targetpad_in_medical)
+        return targetpad_transform(
+            target_ratio,
+            input_dim,
+            force_rgb=force_rgb,
+            apply_targetpad=use_targetpad,
+        )
+    raise ValueError("Preprocess transform should be in ['clip', 'squarepad', 'targetpad']")
+
+
+def _build_train_preprocess(
+    transform: str,
+    input_dim: int,
+    target_ratio: float,
+    eval_preprocess,
+    clip_model_name: str,
+    enable_vit_train_aug: bool,
+    force_rgb: bool,
+    disable_targetpad_in_medical: bool,
+    medical_mode: bool,
+):
+    is_vit_family = ("ViT" in str(clip_model_name)) or ("RETFound" in str(clip_model_name))
+    if not (enable_vit_train_aug and is_vit_family):
+        return eval_preprocess
+
+    prefix_ops = []
+    if transform == "targetpad":
+        use_targetpad = not (medical_mode and disable_targetpad_in_medical)
+        if use_targetpad:
+            prefix_ops.append(TargetPad(target_ratio, input_dim))
+    elif transform == "squarepad":
+        prefix_ops.append(SquarePad(input_dim))
+
+    # For ViT-like backbones, mild geometric + photometric augmentation improves stability
+    # when only training the Combiner.
+    return transforms.Compose(prefix_ops + [
+        transforms.RandomResizedCrop(
+            input_dim,
+            scale=(0.85, 1.0),
+            ratio=(0.9, 1.1),
+            interpolation=InterpolationMode.BICUBIC,
+        ),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomApply([transforms.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.08, hue=0.02)], p=0.4),
+        transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.8))], p=0.15),
+        ToClipTensor(force_rgb=force_rgb),
+        transforms.Normalize(CLIP_MEAN, CLIP_STD),
+    ])
+
 def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[str],
                           projection_dim: int, hidden_dim: int, num_epochs: int, clip_model_name: str,
                           combiner_lr: float, batch_size: int, clip_bs: int, validation_frequency: int,
@@ -62,8 +228,9 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S") + f"_pid{os.getpid()}"
+    model_tag = _safe_model_tag(clip_model_name)
     training_path: Path = Path(
-        base_path / f"models/combiner_trained_on_fiq_{clip_model_name}_{training_start}")
+        base_path / f"models/combiner_trained_on_fiq_{model_tag}_{training_start}")
     training_path.mkdir(exist_ok=False, parents=True)
 
     # 保存超参数
@@ -71,7 +238,41 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
         json.dump(training_hyper_params, file, sort_keys=True, indent=4)
 
 # === 模型加载逻辑对齐 ===
-    if "RetiZero" in clip_model_name:
+    if _is_blip_model_name(clip_model_name):
+        print("🔧 正在初始化 BLIP 适配器...")
+        try:
+            from src.blip_adapter import BLIPAdapter
+        except ImportError:
+            from blip_adapter import BLIPAdapter
+
+        blip_input_resolution = int(kwargs.get("blip_input_resolution", 224))
+        blip_projection_dim = int(kwargs.get("blip_projection_dim", projection_dim))
+        clip_model = BLIPAdapter(
+            model_type=str(kwargs.get("blip_model_type") or clip_model_name),
+            backend=str(kwargs.get("blip_backend", "auto")),
+            model_name=kwargs.get("blip_model_name"),
+            model_path=kwargs.get("clip_model_path"),
+            projection_dim=blip_projection_dim,
+            input_resolution=blip_input_resolution,
+            max_text_len=int(kwargs.get("blip_max_text_len", 77)),
+            device=torch.device(device),
+            normalize_output=False,
+        ).to(device)
+        if hasattr(clip_model, "initialize_projection_heads"):
+            print("Adapter diagnostic for frozen feature extractor:")
+            print(json.dumps(clip_model.initialize_projection_heads(device=torch.device(device)), indent=4, ensure_ascii=False))
+            if getattr(clip_model, "_projection_heads_random", False):
+                print(
+                    "WARNING: This BLIP/BLIP2 frozen+combiner run uses randomly initialized adapter projection heads. "
+                    "Treat the result as a random-head baseline, not as a fair frozen BLIP2 baseline."
+                )
+        clip_preprocess = transforms.Compose([
+            transforms.Resize(blip_input_resolution, interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(blip_input_resolution),
+            ToClipTensor(force_rgb=force_rgb),
+            transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
+        ])
+    elif "RetiZero" in clip_model_name:
         print("🔧 正在初始化 RetiZero 适配器...")
         try:
             from src.retizero_adapter import RetiZeroAdapter
@@ -85,37 +286,40 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
         # 1. 实例化适配器
         clip_model = RetiZeroAdapter(model_path).to(device)
         
-        # 2. 为了兼容原代码的 clip_model.visual.xxx 调用，我们在适配器里手动挂载属性
-        # 假设 RetiZero 输出是 1024，输入是 224
-        clip_model.visual = type('', (), {})() # 创建一个空对象
-        clip_model.visual.input_resolution = 224
-        clip_model.visual.output_dim = 1024 
-        
         # --- src/combiner_train.py ---
 
-        from torchvision import transforms
-        from torchvision.transforms.functional import InterpolationMode
+        clip_preprocess = transforms.Compose([
+            transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
+        ])
+    elif "RETFound" in clip_model_name:
+        print("🔧 正在初始化 RETFound 适配器...")
+        try:
+            from src.retfound_adapter import RETFoundAdapter
+        except ImportError:
+            from retfound_adapter import RETFoundAdapter
 
-        # 修正：加上 is_train 参数，即使函数内部没用到它，也要接收它
-        def build_transforms(input_dim=224, is_train=False):
-            """
-            针对 FashionIQ 和 RetiZero 的通用预处理
-            增加了 is_train 参数以对齐 combiner_train.py 的调用接口
-            """
-            # 统一返回两个值，因为原本的代码里用了 _, clip_preprocess = ...
-            # 第一个值通常是带 Augmentation 的，第二个是 Eval 用的。这里我们统一用标准的。
-            preprocess = transforms.Compose([
-                transforms.Resize(input_dim, interpolation=InterpolationMode.BICUBIC),
-                transforms.CenterCrop(input_dim),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=(0.48145466, 0.4578275, 0.40821073), 
-                    std=(0.26862954, 0.26130258, 0.27577711)
-                )
-            ])
-            return preprocess, preprocess # 返回两次，对齐解包逻辑
+        backbone_path = kwargs.get("retfound_backbone_path") or kwargs.get("clip_model_path")
+        if not backbone_path:
+            raise ValueError("RETFound 需要提供 --retfound-backbone-path 或 --clip-model-path")
 
-        _, clip_preprocess = build_transforms(is_train=False)
+        retfound_text_model = kwargs.get("retfound_text_model", "ViT-L/14")
+        clip_model = RETFoundAdapter(
+            backbone_path=backbone_path,
+            text_model_name=retfound_text_model,
+            projection_dim=projection_dim,
+            input_resolution=224,
+        ).to(device)
+
+        preprocess = transforms.Compose([
+            transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
+        ])
+        clip_preprocess = preprocess
     else:
         # 官方 CLIP 逻辑
         clip_model, clip_preprocess = clip.load(clip_model_name, device=device, jit=False)
@@ -128,16 +332,39 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
     input_dim = clip_model.visual.input_resolution
     feature_dim = clip_model.visual.output_dim
 
-    # 预处理选择
-    if transform == "clip":
-        preprocess = clip_preprocess
-    elif transform == "squarepad":
-        preprocess = squarepad_transform(input_dim)
-    elif transform == "targetpad":
-        target_ratio = kwargs['target_ratio']
-        preprocess = targetpad_transform(target_ratio, input_dim)
-    else:
-        raise ValueError("Preprocess transform should be in ['clip', 'squarepad', 'targetpad']")
+    target_ratio = kwargs.get('target_ratio', 1.25)
+    enable_vit_train_aug = not bool(kwargs.get("disable_vit_train_aug", False))
+    medical_mode = bool(kwargs.get("medical_mode", False))
+    disable_targetpad_in_medical = bool(kwargs.get("disable_targetpad_in_medical", False))
+    force_rgb = bool(kwargs.get("force_rgb", True))
+
+    eval_preprocess = _build_eval_preprocess(
+        transform,
+        input_dim,
+        target_ratio,
+        clip_preprocess,
+        force_rgb,
+        medical_mode,
+        disable_targetpad_in_medical,
+    )
+    train_preprocess = _build_train_preprocess(
+        transform=transform,
+        input_dim=input_dim,
+        target_ratio=target_ratio,
+        eval_preprocess=eval_preprocess,
+        clip_model_name=clip_model_name,
+        enable_vit_train_aug=enable_vit_train_aug,
+        force_rgb=force_rgb,
+        disable_targetpad_in_medical=disable_targetpad_in_medical,
+        medical_mode=medical_mode,
+    )
+    print(
+        "🧪 Preprocess split: "
+        f"train_aug={'ON' if train_preprocess is not eval_preprocess else 'OFF'}, "
+        f"eval=deterministic, force_rgb={'ON' if force_rgb else 'OFF'}, "
+        f"medical_mode={'ON' if medical_mode else 'OFF'}, "
+        f"targetpad_in_medical={'OFF' if (medical_mode and disable_targetpad_in_medical) else 'ON'}"
+    )
 
     
     # --- src/combiner_train.py 修改如下 ---
@@ -147,14 +374,17 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
         print('Trying to load the CLIP model')
         
         # 1. 自动检测模型身份
-        is_retizero = (kwargs.get("clip_model_name") == 'RetiZero') or \
-                      (type(clip_model).__name__ == 'RetiZeroAdapter')
+        model_name_for_detect = str(clip_model_name)
+        is_retizero = ("RetiZero" in model_name_for_detect) or \
+                  (type(clip_model).__name__ == 'RetiZeroAdapter')
+        is_retfound = ("RETFound" in model_name_for_detect) or \
+                  (type(clip_model).__name__ == 'RETFoundAdapter')
 
         if is_retizero:
             # 检查 clip_model_path 是否指向 LoRA 微调 checkpoint
             clip_model_path = kwargs["clip_model_path"]
             ckpt_probe = torch.load(clip_model_path, map_location='cpu')
-            is_lora_ckpt = 'state_dict' in ckpt_probe and any(
+            is_lora_ckpt = isinstance(ckpt_probe, dict) and 'state_dict' in ckpt_probe and any(
                 k.startswith('img_encoder.') for k in ckpt_probe.get('state_dict', {}).keys()
             )
             del ckpt_probe  # 释放内存
@@ -165,29 +395,31 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
             else:
                 print('✨ [Debug] 身份确认：RetiZero base 模型。')
                 print('✨ 权重已在初始化阶段完成加载，跳过冗余逻辑。')
+        elif is_retfound:
+            print('✨ [Debug] 身份确认：RETFound base 模型。')
+            print('✨ 权重已在初始化阶段完成加载，跳过冗余逻辑。')
+        elif _is_blip_model_name(model_name_for_detect):
+            print('✨ [Debug] 身份确认：BLIP/BLIP2 适配器模型。')
+            print('✨ 权重已在初始化阶段完成加载，跳过冗余逻辑。')
         else:
             # 原有的加载逻辑，仅针对非 RetiZero 模型
             clip_model_path = kwargs["clip_model_path"]
             saved_state_dict = torch.load(clip_model_path, map_location=device)
+            clip_weights = _extract_state_dict_from_checkpoint(saved_state_dict)
+            if clip_weights is None:
+                print('⚠️ Unsupported checkpoint object type; skip manual CLIP weight loading.')
             
-            # 兼容性处理：优先取 "CLIP" 键，再取 "state_dict" 键，否则取全部
-            if "CLIP" in saved_state_dict:
-                clip_weights = saved_state_dict["CLIP"]
-            elif "state_dict" in saved_state_dict and isinstance(saved_state_dict["state_dict"], dict):
-                clip_weights = saved_state_dict["state_dict"]
-            else:
-                clip_weights = saved_state_dict
-            
-            # 去除 DataParallel/DDP 的 "module." 前缀
-            if any(k.startswith("module.") for k in clip_weights.keys()):
-                clip_weights = {k.replace("module.", "", 1): v for k, v in clip_weights.items()}
-            
-            if any(k.startswith("clip_model.") for k in clip_weights.keys()):
-                clip_model.load_state_dict(clip_weights)
-            else:
-                new_state_dict = {f"clip_model.{k}": v for k, v in clip_weights.items()}
-                clip_model.load_state_dict(new_state_dict)
-            print('CLIP model loaded successfully')
+            if clip_weights is not None:
+                # 去除 DataParallel/DDP 的 "module." 前缀
+                if any(k.startswith("module.") for k in clip_weights.keys()):
+                    clip_weights = {k.replace("module.", "", 1): v for k, v in clip_weights.items()}
+
+                if any(k.startswith("clip_model.") for k in clip_weights.keys()):
+                    model_state_to_load = clip_weights
+                else:
+                    model_state_to_load = {f"clip_model.{k}": v for k, v in clip_weights.items()}
+
+                _safe_load_state_dict(clip_model, model_state_to_load, context="CLIP checkpoint")
 
     # 统一转为 float32
     clip_model = clip_model.float()
@@ -201,31 +433,32 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
 
     for idx, dress_type in enumerate(val_dress_types):
         idx_to_dress_mapping[idx] = dress_type
-        relative_val_dataset = FashionIQDataset('val', [dress_type], 'relative', preprocess)
+        relative_val_dataset = FashionIQDataset('val', [dress_type], 'relative', eval_preprocess)
         relative_val_datasets.append(relative_val_dataset)
-        classic_val_dataset = FashionIQDataset('val', [dress_type], 'classic', preprocess)
+        classic_val_dataset = FashionIQDataset('val', [dress_type], 'classic', eval_preprocess)
         index_features_and_names = extract_index_features(classic_val_dataset, clip_model)
         index_features_list.append(index_features_and_names[0])
         index_names_list.append(index_features_and_names[1])
 
     # 1. 动态获取特征维度 (针对 RetiZero 进行强制矫正)
     if "RetiZero" in clip_model_name:
-        feature_dim = 512
+        feature_dim = int(clip_model.visual.output_dim)
         print(f"🛠️ 身份确认：RetiZero。强制同步 Combiner 输入维度为: {feature_dim}")
+    elif "RETFound" in clip_model_name:
+        feature_dim = clip_model.visual.output_dim
+        print(f"🛠️ 身份确认：RETFound。同步 Combiner 输入维度为: {feature_dim}")
     else:
         # 官方 CLIP (RN50x4 等) 保持原有逻辑
         # 增加一个 DataParallel 的穿透判断
         temp_model = clip_model.module if hasattr(clip_model, 'module') else clip_model
         feature_dim = temp_model.visual.output_dim 
     
-    # 2. 初始化 Combiner
-    # 注意：这里我们建议把 projection_dim 和 hidden_dim 也对齐到 512，
-    # 这样可以让残差连接（Residual Connection）的计算更加顺滑
+    # 2. 初始化 Combiner。使用命令行传入的 projection_dim/hidden_dim，避免隐藏覆盖。
     combiner = Combiner(clip_feature_dim=feature_dim, 
-                        projection_dim=feature_dim, # 建议设为 512
-                        hidden_dim=feature_dim).to(device, non_blocking=True) # 建议设为 512
+                        projection_dim=projection_dim,
+                        hidden_dim=hidden_dim).to(device, non_blocking=True)
 
-    print(f"📊 Combiner 实例已创建，输入维度: {feature_dim}, 隐藏层维度: {feature_dim}")
+    print(f"📊 Combiner 实例已创建，输入维度: {feature_dim}, 投影维度: {projection_dim}, 隐藏层维度: {hidden_dim}")
 
     # 3. 多卡支持
     if torch.cuda.device_count() > 1:
@@ -234,13 +467,23 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
     
     combiner = combiner.to(device)
 
-    relative_train_dataset = FashionIQDataset('train', train_dress_types, 'relative', preprocess)
+    relative_train_dataset = FashionIQDataset('train', train_dress_types, 'relative', train_preprocess)
     relative_train_loader = DataLoader(dataset=relative_train_dataset, batch_size=batch_size,
-                                       num_workers=multiprocessing.cpu_count(), pin_memory=True, collate_fn=collate_fn,
+                                       num_workers=_dataloader_num_workers(), pin_memory=True, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
 
-    optimizer = optim.Adam(combiner.parameters(), lr=combiner_lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    weight_decay = float(kwargs.get("weight_decay", 1e-4))
+    max_grad_norm = float(kwargs.get("max_grad_norm", 1.0))
+    scheduler_patience = int(kwargs.get("scheduler_patience", 3))
+    scheduler_factor = float(kwargs.get("scheduler_factor", 0.5))
+    min_lr = float(kwargs.get("min_lr", 1e-7))
+
+    optimizer = optim.Adam(combiner.parameters(), lr=combiner_lr, weight_decay=weight_decay)
+    # ReduceLROnPlateau：当 average_recall 连续 patience 次验证不再提升时，LR 乘以 factor
+    # patience=5 + validation_frequency=5 => 约 25 epoch 无改善才降 LR，150轮内可触发 2-3 次
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=scheduler_factor, patience=scheduler_patience, min_lr=min_lr, verbose=True
+    )
     crossentropy_criterion = nn.CrossEntropyLoss()
     scaler = torch.cuda.amp.GradScaler()
 
@@ -253,7 +496,12 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
     print('Training loop started')
     for epoch in range(num_epochs):
         # 只对官方 CLIP 模型进行权重转换
-        if torch.cuda.is_available() and "RetiZero" not in clip_model_name:
+        if (
+            torch.cuda.is_available()
+            and "RetiZero" not in clip_model_name
+            and "RETFound" not in clip_model_name
+            and not _is_blip_model_name(clip_model_name)
+        ):
             clip.model.convert_weights(clip_model)
         
         with experiment.train():
@@ -280,7 +528,11 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
                     input_captions = generate_randomized_fiq_caption(flattened_captions)
 
                 # 2. 准备文本输入（核心修改：RetiZero 不在循环外分词）
-                if "RetiZero" in clip_model_name:
+                if (
+                    "RetiZero" in clip_model_name
+                    or "RETFound" in clip_model_name
+                    or _is_blip_model_name(clip_model_name)
+                ):
                     # 保持为原始字符串列表 List[str]
                     text_inputs = input_captions 
                 else:
@@ -327,18 +579,14 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
                     # 1. 获取原始模型实例
                     raw_model = combiner.module if isinstance(combiner, torch.nn.DataParallel) else combiner
 
-                    # 2. 直接获取缩放系数（不再取指数）
-                    # 既然 Combiner 里定义了 self.logit_scale = 100，这个值本身就是最强的缩放了
+                    # 2. 获取缩放系数。若为参数，则按 CLIP 约定使用 exp(logit_scale)
                     l_scale = raw_model.logit_scale 
                     if torch.is_tensor(l_scale):
-                        # 如果它是 Tensor (nn.Parameter)，取数值
-                        l_scale = l_scale.detach().item() 
+                        l_scale = l_scale.exp()
                     else:
-                        # 如果它是普通的 int 或 float
                         l_scale = float(l_scale)
 
                     # 3. 计算相似度矩阵
-                    # 这里的公式变为：L = 100 * F * T^T
                     logits = l_scale * (fused_features @ target_image_features.t())
 
                     if torch.isnan(fused_features).any() or torch.isnan(target_image_features).any():
@@ -350,6 +598,8 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
 
                 # 反向传播
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(combiner.parameters(), max_norm=max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -373,8 +623,6 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
 
             training_log_frame = pd.concat([training_log_frame, pd.DataFrame(data={'epoch': epoch, 'train_epoch_loss': train_epoch_loss}, index=[0])])
             training_log_frame.to_csv(str(training_path / 'train_metrics.csv'), index=False)
-
-        scheduler.step()
 
         # --- 验证阶段 (R@1, R@5, R@10 版) ---
         if epoch % validation_frequency == 0:
@@ -432,6 +680,11 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
                 log_dict.update(results_dict)
                 validation_log_frame = pd.concat([validation_log_frame, pd.DataFrame(data=log_dict, index=[0])])
                 validation_log_frame.to_csv(str(training_path / 'validation_metrics.csv'), index=False)
+
+            # ReduceLROnPlateau：传入当前 average_recall，在验证节点触发降 LR 逻辑
+            scheduler.step(current_average_recall)
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"📉 Current LR after scheduler: {current_lr:.2e}")
 
             # --- 保存最优模型逻辑 ---
             if save_training:
@@ -538,7 +791,41 @@ def combiner_training_cirr(projection_dim: int, hidden_dim: int, num_epochs: int
     with open(training_path / "training_hyperparameters.json", 'w+') as file:
         json.dump(training_hyper_params, file, sort_keys=True, indent=4)
 
-    clip_model, clip_preprocess = clip.load(clip_model_name, device=device, jit=False)
+    if _is_blip_model_name(clip_model_name):
+        try:
+            from src.blip_adapter import BLIPAdapter
+        except ImportError:
+            from blip_adapter import BLIPAdapter
+
+        blip_input_resolution = int(kwargs.get("blip_input_resolution", 224))
+        blip_projection_dim = int(kwargs.get("blip_projection_dim", projection_dim))
+        clip_model = BLIPAdapter(
+            model_type=str(kwargs.get("blip_model_type") or clip_model_name),
+            backend=str(kwargs.get("blip_backend", "auto")),
+            model_name=kwargs.get("blip_model_name"),
+            model_path=kwargs.get("clip_model_path"),
+            projection_dim=blip_projection_dim,
+            input_resolution=blip_input_resolution,
+            max_text_len=int(kwargs.get("blip_max_text_len", 77)),
+            device=torch.device(device),
+            normalize_output=False,
+        ).to(device)
+        if hasattr(clip_model, "initialize_projection_heads"):
+            print("Adapter diagnostic for frozen feature extractor:")
+            print(json.dumps(clip_model.initialize_projection_heads(device=torch.device(device)), indent=4, ensure_ascii=False))
+            if getattr(clip_model, "_projection_heads_random", False):
+                print(
+                    "WARNING: This BLIP/BLIP2 frozen+combiner run uses randomly initialized adapter projection heads. "
+                    "Treat the result as a random-head baseline, not as a fair frozen BLIP2 baseline."
+                )
+        clip_preprocess = transforms.Compose([
+            transforms.Resize(blip_input_resolution, interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(blip_input_resolution),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
+        ])
+    else:
+        clip_model, clip_preprocess = clip.load(clip_model_name, device=device, jit=False)
 
     clip_model.eval()
     input_dim = clip_model.visual.input_resolution
@@ -582,13 +869,21 @@ def combiner_training_cirr(projection_dim: int, hidden_dim: int, num_epochs: int
         combiner = nn.DataParallel(combiner)
     
     # 3. 接着才是定义 Dataset 和 Loader
-    relative_train_dataset = FashionIQDataset('train', train_dress_types, 'relative', preprocess)
-    # ... 后面的 DataLoader 保持不变
-    relative_train_loader = DataLoader(dataset=relative_train_dataset, batch_size=batch_size, num_workers=8,
+    relative_train_dataset = CIRRDataset('train', 'relative', preprocess)
+    relative_train_loader = DataLoader(dataset=relative_train_dataset, batch_size=batch_size,
+                                       num_workers=_dataloader_num_workers(8),
                                        pin_memory=True, collate_fn=collate_fn, drop_last=True, shuffle=True)
 
     # Define the optimizer, the loss and the grad scaler
-    optimizer = optim.Adam(combiner.parameters(), lr=combiner_lr)
+    weight_decay = float(kwargs.get("weight_decay", 1e-4))
+    max_grad_norm = float(kwargs.get("max_grad_norm", 1.0))
+    scheduler_patience = int(kwargs.get("scheduler_patience", 3))
+    scheduler_factor = float(kwargs.get("scheduler_factor", 0.5))
+    min_lr = float(kwargs.get("min_lr", 1e-7))
+    optimizer = optim.Adam(combiner.parameters(), lr=combiner_lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=scheduler_factor, patience=scheduler_patience, min_lr=min_lr, verbose=True
+    )
     crossentropy_criterion = nn.CrossEntropyLoss()
     scaler = torch.cuda.amp.GradScaler()
 
@@ -605,7 +900,7 @@ def combiner_training_cirr(projection_dim: int, hidden_dim: int, num_epochs: int
     # Start with the training loop
     print('Training loop started')
     for epoch in range(num_epochs):
-        if torch.cuda.is_available():  # RuntimeError: "slow_conv2d_cpu" not implemented for 'Half'
+        if torch.cuda.is_available() and not _is_blip_model_name(clip_model_name):  # RuntimeError: "slow_conv2d_cpu" not implemented for 'Half'
             clip.model.convert_weights(clip_model)  # Convert CLIP model in fp16 to reduce computation and memory
         with experiment.train():
             train_running_results = {'images_in_epoch': 0, 'accumulated_train_loss': 0}
@@ -619,7 +914,10 @@ def combiner_training_cirr(projection_dim: int, hidden_dim: int, num_epochs: int
 
                 reference_images = reference_images.to(device, non_blocking=True)
                 target_images = target_images.to(device, non_blocking=True)
-                text_inputs = clip.tokenize(captions, truncate=True).to(device, non_blocking=True)
+                if _is_blip_model_name(clip_model_name) or "RETFound" in clip_model_name:
+                    text_inputs = list(captions)
+                else:
+                    text_inputs = clip.tokenize(captions, truncate=True).to(device, non_blocking=True)
 
                 # Extract the features with CLIP
                 with torch.no_grad():
@@ -630,9 +928,15 @@ def combiner_training_cirr(projection_dim: int, hidden_dim: int, num_epochs: int
                     target_features = torch.vstack(
                         [clip_model.encode_image(mini_batch).float() for mini_batch in target_images_list])
 
-                    text_inputs_list = torch.split(text_inputs, clip_bs)
-                    text_features = torch.vstack(
-                        [clip_model.encode_text(mini_batch).float() for mini_batch in text_inputs_list])
+                    if isinstance(text_inputs, list):
+                        text_features = torch.vstack([
+                            clip_model.encode_text(text_inputs[i:i + clip_bs]).float()
+                            for i in range(0, len(text_inputs), clip_bs)
+                        ])
+                    else:
+                        text_inputs_list = torch.split(text_inputs, clip_bs)
+                        text_features = torch.vstack(
+                            [clip_model.encode_text(mini_batch).float() for mini_batch in text_inputs_list])
 
                 # Compute the logits and loss
                 with torch.cuda.amp.autocast():
@@ -642,6 +946,8 @@ def combiner_training_cirr(projection_dim: int, hidden_dim: int, num_epochs: int
 
                 # Backpropagate and update the weights
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(combiner.parameters(), max_norm=max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -665,8 +971,9 @@ def combiner_training_cirr(projection_dim: int, hidden_dim: int, num_epochs: int
                 combiner.eval()
 
                 # Compute and log validation metrics
+                combining_func = combiner.module.combine_features if isinstance(combiner, nn.DataParallel) else combiner.combine_features
                 results = compute_cirr_val_metrics(relative_val_dataset, clip_model, val_index_features,
-                                                   val_index_names, combiner.combine_features)
+                                                   val_index_names, combining_func)
                 group_recall_at1, group_recall_at2, group_recall_at3, recall_at1, recall_at5, recall_at10, recall_at50 = results
 
                 results_dict = {
@@ -709,6 +1016,10 @@ def combiner_training_cirr(projection_dim: int, hidden_dim: int, num_epochs: int
                     if not save_best:
                         save_model(f'combiner_{epoch}', epoch, combiner, training_path)
 
+                scheduler.step(results_dict['arithmetic_mean'])
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"📉 Current LR after scheduler: {current_lr:.2e}")
+
 
 if __name__ == '__main__':
     parser = ArgumentParser()
@@ -719,15 +1030,33 @@ if __name__ == '__main__':
     parser.add_argument("--projection-dim", default=640 * 4, type=int, help='Combiner projection dim')
     parser.add_argument("--hidden-dim", default=640 * 8, type=int, help="Combiner hidden dim")
     parser.add_argument("--num-epochs", default=300, type=int, help="number training epochs")
-    parser.add_argument("--clip-model-name", default="RN50x4", type=str, help="CLIP model to use, e.g 'RN50', 'RN50x4'")
+    parser.add_argument("--clip-model-name", default="RN50x4", type=str,
+                        help="CLIP model to use, e.g. 'RN50x4', 'ViT-B/32', 'ViT-L/14' (default remains RN50x4)")
     parser.add_argument("--clip-model-path", type=str, help="Path to the fine-tuned CLIP model")
     parser.add_argument("--combiner-lr", default=2e-5, type=float, help="Combiner learning rate")
+    parser.add_argument("--weight-decay", default=1e-4, type=float, help="Weight decay for Combiner optimizer")
+    parser.add_argument("--max-grad-norm", default=1.0, type=float, help="Gradient clipping max norm")
+    parser.add_argument("--scheduler-patience", default=3, type=int,
+                        help="Patience for ReduceLROnPlateau scheduler")
+    parser.add_argument("--scheduler-factor", default=0.5, type=float,
+                        help="Multiplicative LR decay factor for ReduceLROnPlateau")
+    parser.add_argument("--min-lr", default=1e-7, type=float,
+                        help="Lower bound for ReduceLROnPlateau learning rate")
     parser.add_argument("--batch-size", default=1024, type=int, help="Batch size of the Combiner training")
     parser.add_argument("--clip-bs", default=32, type=int, help="Batch size during CLIP feature extraction")
     parser.add_argument("--validation-frequency", default=3, type=int, help="Validation frequency expressed in epochs")
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
                         help="Preprocess pipeline, should be in ['clip', 'squarepad', 'targetpad'] ")
+    parser.add_argument("--disable-vit-train-aug", action='store_true',
+                        help="Disable train-time augmentation for ViT/RETFound combiner training")
+    parser.add_argument("--medical-mode", action='store_true',
+                        help="Enable medical preprocessing mode for ablation")
+    parser.add_argument("--disable-targetpad-in-medical", action='store_true',
+                        help="When --medical-mode is enabled, bypass TargetPad in both train/eval pipelines")
+    parser.add_argument("--no-force-rgb", dest="force_rgb", action='store_false',
+                        help="Do not force PIL RGB conversion; keep source channels then coerce tensor to 3 channels")
+    parser.set_defaults(force_rgb=True)
     parser.add_argument("--save-training", dest="save_training", action='store_true',
                         help="Whether save the training model")
     parser.add_argument("--save-best", dest="save_best", action='store_true',
@@ -736,6 +1065,22 @@ if __name__ == '__main__':
     parser.add_argument("--dress-types", nargs='+', default=['shirt', 'dress', 'toptee'], help="fashionIQ categories")
     parser.add_argument("--retizero-base-path", type=str, default=None,
                         help="Path to base RetiZero.pth (used when --clip-model-path is a LoRA checkpoint)")
+    parser.add_argument("--retfound-backbone-path", type=str, default=None,
+                        help="Path to RETFound_mae_natureCFP.pth (used when --clip-model-name RETFound)")
+    parser.add_argument("--retfound-text-model", type=str, default="ViT-L/14",
+                        help="OpenAI CLIP text tower model name used by RETFound adapter")
+    parser.add_argument("--blip-model-type", type=str, default="BLIP",
+                        help="BLIP variant hint, e.g. BLIP or BLIP2")
+    parser.add_argument("--blip-backend", type=str, default="auto",
+                        help="BLIP backend: auto/transformers/lavis")
+    parser.add_argument("--blip-model-name", type=str, default=None,
+                        help="Optional backend model name, e.g. Salesforce/blip2-opt-2.7b")
+    parser.add_argument("--blip-projection-dim", type=int, default=768,
+                        help="Unified embedding dim for BLIP adapter outputs")
+    parser.add_argument("--blip-input-resolution", type=int, default=224,
+                        help="BLIP image resolution for adapter preprocessing")
+    parser.add_argument("--blip-max-text-len", type=int, default=77,
+                        help="Maximum text length used by BLIP tokenizer")
 
     args = parser.parse_args()
     if args.dataset.lower() not in ['fashioniq', 'cirr']:
@@ -748,14 +1093,31 @@ if __name__ == '__main__':
         "clip_model_name": args.clip_model_name,
         "clip_model_path": args.clip_model_path,
         "combiner_lr": args.combiner_lr,
+        "weight_decay": args.weight_decay,
+        "max_grad_norm": args.max_grad_norm,
+        "scheduler_patience": args.scheduler_patience,
+        "scheduler_factor": args.scheduler_factor,
+        "min_lr": args.min_lr,
         "batch_size": args.batch_size,
         "clip_bs": args.clip_bs,
         "validation_frequency": args.validation_frequency,
         "transform": args.transform,
+        "disable_vit_train_aug": args.disable_vit_train_aug,
+        "medical_mode": args.medical_mode,
+        "disable_targetpad_in_medical": args.disable_targetpad_in_medical,
+        "force_rgb": args.force_rgb,
         "target_ratio": args.target_ratio,
         "save_training": args.save_training,
         "save_best": args.save_best,
         "retizero_base_path": args.retizero_base_path,
+        "retfound_backbone_path": args.retfound_backbone_path,
+        "retfound_text_model": args.retfound_text_model,
+        "blip_model_type": args.blip_model_type,
+        "blip_backend": args.blip_backend,
+        "blip_model_name": args.blip_model_name,
+        "blip_projection_dim": args.blip_projection_dim,
+        "blip_input_resolution": args.blip_input_resolution,
+        "blip_max_text_len": args.blip_max_text_len,
     }
 
     if args.api_key and args.workspace:
@@ -769,13 +1131,8 @@ if __name__ == '__main__':
         if args.experiment_name:
             experiment.set_name(args.experiment_name)
     else:
-        print("Comet loging DISABLED, in order to enable it you need to provide an api key and a workspace")
-        experiment = Experiment(
-            api_key="",
-            project_name="",
-            workspace="",
-            disabled=True
-        )
+        print("Comet logging DISABLED, in order to enable it you need to provide an api key and a workspace")
+        experiment = _NullExperiment()
 
     experiment.log_code(folder=str(base_path / 'src'))
     experiment.log_parameters(training_hyper_params)

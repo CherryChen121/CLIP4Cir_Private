@@ -24,12 +24,14 @@ from statistics import mean
 from argparse import ArgumentParser
 
 from retizero_adapter import RetiZeroAdapter
-from data_utils import FashionIQDataset, targetpad_transform
+from data_utils import FashionIQDataset, targetpad_transform, list_fashioniq_categories
 from utils import extract_index_features, element_wise_sum, device
 from validate import compute_fiq_val_metrics
 
-# UWF 眼底疾病类别
-CATEGORIES = ['CH', 'CO', 'NM', 'RB', 'RCH', 'UM']
+# 动态获取数据集类别
+CATEGORIES = list_fashioniq_categories("train")
+if not CATEGORIES:
+    CATEGORIES = ['CH', 'CO', 'NM', 'RB', 'RCH', 'UM', 'IDRiD']
 
 # 默认使用 TRANSFORMERS 离线模式，避免网络问题
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")

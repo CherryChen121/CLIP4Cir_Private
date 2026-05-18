@@ -6,7 +6,7 @@
 
 ## Overview
 
-This project adapts the **Composed Image Retrieval (CIR)** framework to the medical imaging domain. Specifically, we restructure an Ultra-Wide Field (UWF) fundus disease image dataset into the **FashionIQ format** and apply two backbone models — **CLIP (RN50x4)** and **RetiZero** — within the CLIP4Cir training pipeline (CLIP fine-tuning + Combiner network training). The primary evaluation metric is **average recall rate (Recall@1 and Recall@10)** across 6 fundus disease categories.
+This project adapts the **Composed Image Retrieval (CIR)** framework to the medical imaging domain. Specifically, we restructure an Ultra-Wide Field (UWF) fundus disease image dataset into the **FashionIQ format** and apply CLIP-family backbones (**RN50x4**, **ViT-B/32**, **ViT-L/14**) plus **RetiZero** within the CLIP4Cir training pipeline (CLIP fine-tuning + Combiner network training). The primary evaluation metric is **average recall rate (Recall@1 and Recall@10)** across 6 fundus disease categories.
 
 ### Source Projects
 
@@ -93,6 +93,42 @@ CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py \
    --validation-frequency 1 > clip_finetune.log 2>&1 &
 ```
 
+**OpenAI CLIP ViT variants (same entrypoint, different model/checkpoint):**
+
+```bash
+# ViT-B/32 fine-tuning
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py \
+    --dataset FashionIQ \
+    --dress-types CH CO NM RB RCH UM \
+    --num-epochs 100 \
+    --clip-model-name ViT-B/32 \
+    --clip-model-path pretrained_models/fashionIQ/ViT-B-32.pt \
+    --encoder both \
+    --learning-rate 2e-6 \
+    --batch-size 128 \
+    --transform targetpad \
+    --target-ratio 1.25 \
+    --save-training \
+    --save-best \
+    --validation-frequency 1 > clip_finetune_vitb32.log 2>&1 &
+
+# ViT-L/14 fine-tuning (typically lower batch size)
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py \
+    --dataset FashionIQ \
+    --dress-types CH CO NM RB RCH UM \
+    --num-epochs 100 \
+    --clip-model-name ViT-L/14 \
+    --clip-model-path pretrained_models/fashionIQ/ViT-L-14.pt \
+    --encoder both \
+    --learning-rate 2e-6 \
+    --batch-size 64 \
+    --transform targetpad \
+    --target-ratio 1.25 \
+    --save-training \
+    --save-best \
+    --validation-frequency 1 > clip_finetune_vitl14.log 2>&1 &
+```
+
 ### Stage 2: Combiner Network Training
 
 Train the Combiner network on top of fixed (frozen) encoder features. Supports both CLIP (RN50x4) and RetiZero as backbone.
@@ -117,6 +153,48 @@ CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py \
     --save-best \
     --validation-frequency 5 > combiner_clip.log 2>&1 &
 ```
+
+**ViT-B/32 and ViT-L/14 Combiner training examples:**
+
+```bash
+# ViT-B/32 (feature dim = 512 for OpenAI ViT-B/32)
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py \
+    --dataset FashionIQ \
+    --dress-types CH CO NM RB RCH UM \
+    --projection-dim 512 \
+    --hidden-dim 1024 \
+    --num-epochs 150 \
+    --clip-model-name ViT-B/32 \
+    --clip-model-path pretrained_models/fashionIQ/ViT-B-32.pt \
+    --combiner-lr 2e-5 \
+    --batch-size 128 \
+    --clip-bs 16 \
+    --transform targetpad \
+    --target-ratio 1.25 \
+    --save-training \
+    --save-best \
+    --validation-frequency 5 > combiner_vitb32.log 2>&1 &
+
+# ViT-L/14 (feature dim = 768)
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py \
+    --dataset FashionIQ \
+    --dress-types CH CO NM RB RCH UM \
+    --projection-dim 768 \
+    --hidden-dim 1536 \
+    --num-epochs 150 \
+    --clip-model-name ViT-L/14 \
+    --clip-model-path pretrained_models/fashionIQ/ViT-L-14.pt \
+    --combiner-lr 2e-5 \
+    --batch-size 128 \
+    --clip-bs 16 \
+    --transform targetpad \
+    --target-ratio 1.25 \
+    --save-training \
+    --save-best \
+    --validation-frequency 5 > combiner_vitl14.log 2>&1 &
+```
+
+Training folder names are now normalized by model tag (for example `vitb32` and `vitl14`) to avoid slash-related path issues, while `--clip-model-name` keeps the original OpenAI model string.
 
 **RetiZero backbone:**
 

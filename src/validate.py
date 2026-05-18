@@ -19,6 +19,64 @@ from combiner import Combiner
 from utils import extract_index_features, collate_fn, element_wise_sum, device
 
 
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    """Unwrap common wrappers (DDP/DataParallel/custom wrappers) to reach the core model."""
+    unwrapped = model
+    while True:
+        if hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+            continue
+        if hasattr(unwrapped, "clip_model"):
+            unwrapped = unwrapped.clip_model
+            continue
+        break
+    return unwrapped
+
+
+def _is_blip_model_name(model_name: str) -> bool:
+    return "BLIP" in str(model_name).upper()
+
+
+def _model_handles_raw_text(model: nn.Module) -> bool:
+    model_type = str(type(_unwrap_model(model)))
+    return ("RetiZero" in model_type) or ("RETFound" in model_type) or ("BLIP" in model_type)
+
+
+def _encode_text_features(model: nn.Module, input_captions: List[str]) -> torch.Tensor:
+    if _model_handles_raw_text(model):
+        return model(input_captions, mode='text')
+    text_inputs = clip.tokenize(input_captions, truncate=True).to(device, non_blocking=True)
+    return model(text_inputs, mode='text')
+
+
+def _safe_load_state_dict(model: nn.Module, state_dict: dict, *, context: str):
+    model_state = model.state_dict()
+    shape_mismatch = []
+    filtered_state = {}
+
+    for key, value in state_dict.items():
+        if key not in model_state:
+            continue
+        if model_state[key].shape != value.shape:
+            shape_mismatch.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+            continue
+        filtered_state[key] = value
+
+    if shape_mismatch:
+        preview = "\n".join(
+            f"  - {k}: ckpt={s1}, model={s2}" for k, s1, s2 in shape_mismatch[:10]
+        )
+        raise RuntimeError(
+            f"{context} 检测到参数维度不匹配，已中止加载。\n{preview}"
+        )
+
+    load_result = model.load_state_dict(filtered_state, strict=False)
+    print(
+        f"{context} loaded. matched_keys={len(filtered_state)}, "
+        f"missing_keys={len(load_result.missing_keys)}, unexpected_keys={len(load_result.unexpected_keys)}"
+    )
+
+
 def compute_fiq_val_metrics(relative_val_dataset: FashionIQDataset, clip_model: CLIP, index_features: torch.tensor,
                             index_names: List[str], combining_function: callable) -> Tuple[float, float, float]:
     """
@@ -92,21 +150,8 @@ def generate_fiq_val_predictions(clip_model: nn.Module, relative_val_dataset: Fa
                 for i in range(0, len(flattened_captions), 2)
             ]
         
-        # --- 核心修复点：针对 RetiZero 跳过提前 Tokenize ---
-        # 穿透 DataParallel 获取真实模型类名
-        model_type_str = str(type(clip_model.module if hasattr(clip_model, 'module') else clip_model))
-        
-        if "RetiZero" in model_type_str:
-            # RetiZero 适配器会在内部 encode_text 时自己分词，所以这里直接传 List[str]
-            text_inputs = input_captions 
-        else:
-            # 官方 CLIP (RN50x4 等) 仍需在这里 Tokenize
-            import clip
-            text_inputs = clip.tokenize(input_captions, truncate=True).to(device, non_blocking=True)
-
         with torch.no_grad():
-            # 调用模型对象本身，触发适配器的 forward 逻辑
-            text_features = clip_model(text_inputs, mode='text')
+            text_features = _encode_text_features(clip_model, input_captions)
             
             # 4. 获取图像特征 (从预计算的 index_features 中提取)
             if len(reference_names) == 1:
@@ -228,19 +273,18 @@ def generate_cirr_val_predictions(clip_model: CLIP, relative_val_dataset: CIRRDa
     name_to_feat = dict(zip(index_names, index_features))
 
     # Initialize predicted features, target_names, group_members and reference_names
-    predicted_features = torch.empty((0, clip_model.visual.output_dim)).to(device, non_blocking=True)
+    predicted_features = torch.empty((0, index_features.shape[-1])).to(device, non_blocking=True)
     target_names = []
     group_members = []
     reference_names = []
 
     for batch_reference_names, batch_target_names, captions, batch_group_members in tqdm(
             relative_val_loader):  # Load data
-        text_inputs = clip.tokenize(captions, truncate=True).to(device, non_blocking=True)##############################################
         batch_group_members = np.array(batch_group_members).T.tolist()
 
         # Compute the predicted features
         with torch.no_grad():
-            text_features = clip_model.encode_text(text_inputs)
+            text_features = _encode_text_features(clip_model, list(captions))
             # Check whether a single element is in the batch due to the exception raised by torch.stack when used with
             # a single tensor
             if text_features.shape[0] == 1:
@@ -279,6 +323,26 @@ def cirr_val_retrieval(combining_function: callable, clip_model: CLIP, preproces
                                     combining_function)
 
 
+def _load_optional_clip_weights(clip_model: CLIP, clip_model_path: Path):
+    """Support {'CLIP': ...}, {'state_dict': ...}, and raw OpenAI CLIP state_dict formats."""
+    if not clip_model_path:
+        return
+
+    print('Trying to load the CLIP model')
+    saved_state_dict = torch.load(clip_model_path, map_location=device)
+    if isinstance(saved_state_dict, dict) and "CLIP" in saved_state_dict:
+        clip_weights = saved_state_dict["CLIP"]
+    elif isinstance(saved_state_dict, dict) and "state_dict" in saved_state_dict and isinstance(saved_state_dict["state_dict"], dict):
+        clip_weights = saved_state_dict["state_dict"]
+    else:
+        clip_weights = saved_state_dict
+
+    if any(k.startswith("module.") for k in clip_weights.keys()):
+        clip_weights = {k.replace("module.", "", 1): v for k, v in clip_weights.items()}
+
+    _safe_load_state_dict(clip_model, clip_weights, context="Validation CLIP checkpoint")
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--dataset", type=str, required=True, help="should be either 'CIRR' or 'fashionIQ'")
@@ -287,7 +351,8 @@ def main():
     parser.add_argument("--combiner-path", type=Path, help="path to trained Combiner")
     parser.add_argument("--projection-dim", default=640 * 4, type=int, help='Combiner projection dim')
     parser.add_argument("--hidden-dim", default=640 * 8, type=int, help="Combiner hidden dim")
-    parser.add_argument("--clip-model-name", default="RN50x4", type=str, help="CLIP model to use, e.g 'RN50', 'RN50x4'")
+    parser.add_argument("--clip-model-name", default="RN50x4", type=str,
+                        help="CLIP model to use, e.g. 'RN50x4', 'ViT-B/32', 'ViT-L/14' (default remains RN50x4)")
     parser.add_argument("--clip-model-path", type=Path, help="Path to the fine-tuned CLIP model")
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
@@ -295,15 +360,28 @@ def main():
 
     args = parser.parse_args()
 
-    clip_model, clip_preprocess = clip.load(args.clip_model_name, device=device, jit=False)
+    if _is_blip_model_name(args.clip_model_name):
+        try:
+            from src.blip_adapter import BLIPAdapter
+        except ImportError:
+            from blip_adapter import BLIPAdapter
+
+        clip_model = BLIPAdapter(
+            model_type=args.clip_model_name,
+            model_path=str(args.clip_model_path) if args.clip_model_path else None,
+            projection_dim=args.projection_dim,
+            input_resolution=224,
+            device=device,
+            normalize_output=False,
+        ).to(device)
+        clip_preprocess = targetpad_transform(args.target_ratio, clip_model.visual.input_resolution)
+    else:
+        clip_model, clip_preprocess = clip.load(args.clip_model_name, device=device, jit=False)
+
     input_dim = clip_model.visual.input_resolution
     feature_dim = clip_model.visual.output_dim
 
-    if args.clip_model_path:
-        print('Trying to load the CLIP model')
-        saved_state_dict = torch.load(args.clip_model_path, map_location=device)
-        clip_model.load_state_dict(saved_state_dict["CLIP"])
-        print('CLIP model loaded successfully')
+    _load_optional_clip_weights(clip_model, args.clip_model_path)
 
     if args.transform == 'targetpad':
         print('Target pad preprocess pipeline is used')
@@ -342,35 +420,30 @@ def main():
         print(f"{recall_at50 = }")
 
     elif args.dataset.lower() == 'fashioniq':
+        average_recall1_list = []
+        average_recall5_list = []
         average_recall10_list = []
-        average_recall50_list = []
 
-        shirt_recallat10, shirt_recallat50 = fashioniq_val_retrieval('shirt', combining_function, clip_model,
-                                                                     preprocess)
-        average_recall10_list.append(shirt_recallat10)
-        average_recall50_list.append(shirt_recallat50)
+        from data_utils import list_fashioniq_categories
+        valid_dress_types = list_fashioniq_categories("val")
+        
+        # fallback if not found
+        if not valid_dress_types:
+            valid_dress_types = ['shirt', 'dress', 'toptee']
 
-        dress_recallat10, dress_recallat50 = fashioniq_val_retrieval('dress', combining_function, clip_model,
-                                                                     preprocess)
-        average_recall10_list.append(dress_recallat10)
-        average_recall50_list.append(dress_recallat50)
+        for dt in valid_dress_types:
+            r1, r5, r10 = fashioniq_val_retrieval(dt, combining_function, clip_model, preprocess)
+            average_recall1_list.append(r1)
+            average_recall5_list.append(r5)
+            average_recall10_list.append(r10)
+            
+            print(f"{dt}_recallat1 = {r1}")
+            print(f"{dt}_recallat5 = {r5}")
+            print(f"{dt}_recallat10 = {r10}")
 
-        toptee_recallat10, toptee_recallat50 = fashioniq_val_retrieval('toptee', combining_function, clip_model,
-                                                                       preprocess)
-        average_recall10_list.append(toptee_recallat10)
-        average_recall50_list.append(toptee_recallat50)
-
-        print(f"\n{shirt_recallat10 = }")
-        print(f"{shirt_recallat50 = }")
-
-        print(f"{dress_recallat10 = }")
-        print(f"{dress_recallat50 = }")
-
-        print(f"{toptee_recallat10 = }")
-        print(f"{toptee_recallat50 = }")
-
+        print(f"average recall1 = {mean(average_recall1_list)}")
+        print(f"average recall5 = {mean(average_recall5_list)}")
         print(f"average recall10 = {mean(average_recall10_list)}")
-        print(f"average recall50 = {mean(average_recall50_list)}")
     else:
         raise ValueError("Dataset should be either 'CIRR' or 'FashionIQ")
 

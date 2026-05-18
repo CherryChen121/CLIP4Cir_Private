@@ -11,9 +11,130 @@ from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normal
 
 base_path = Path(__file__).absolute().parents[1].absolute()
 
+DEFAULT_EXTERNAL_DATA_ROOT = Path("/data0/qrchen/datasets")
+FASHIONIQ_REQUIRED_DIRS = ("captions", "image_splits", "images")
+MEDICAL_FIQ_ROOT_BY_CATEGORY = {
+    "CH": "UWF_CIR_Dataset_cold",
+    "CO": "UWF_CIR_Dataset_cold",
+    "NM": "UWF_CIR_Dataset_cold",
+    "RB": "UWF_CIR_Dataset_cold",
+    "RCH": "UWF_CIR_Dataset_cold",
+    "UM": "UWF_CIR_Dataset_cold",
+    "IDRiD": "IDRiD_CIR_Dataset_cold",
+}
+
+
+def _has_fashioniq_layout(path: Path) -> bool:
+    return path.exists() and all((path / name).is_dir() for name in FASHIONIQ_REQUIRED_DIRS)
+
+
+def _env_path(name: str) -> Path:
+    value = os.environ.get(name)
+    return Path(value).expanduser().resolve() if value else None
+
+
+def _data_root() -> Path:
+    return _env_path("CLIP4CIR_DATA_ROOT") or DEFAULT_EXTERNAL_DATA_ROOT
+
+
+def _candidate_fashioniq_roots(category: str = None) -> List[Path]:
+    roots = []
+
+    explicit_fiq_root = _env_path("CLIP4CIR_FASHIONIQ_ROOT")
+    if explicit_fiq_root is not None:
+        roots.append(explicit_fiq_root)
+
+    if category == "IDRiD":
+        explicit_idrid_root = _env_path("CLIP4CIR_IDRID_ROOT")
+        if explicit_idrid_root is not None:
+            roots.append(explicit_idrid_root)
+    elif category in {"CH", "CO", "NM", "RB", "RCH", "UM"}:
+        explicit_uwf_root = _env_path("CLIP4CIR_UWF_ROOT")
+        if explicit_uwf_root is not None:
+            roots.append(explicit_uwf_root)
+
+    data_root = _data_root()
+    if category in MEDICAL_FIQ_ROOT_BY_CATEGORY:
+        roots.append(data_root / MEDICAL_FIQ_ROOT_BY_CATEGORY[category])
+
+    roots.extend([
+        data_root / "fashionIQ_dataset",
+        base_path / "fashionIQ_dataset",
+    ])
+
+    deduped = []
+    seen = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            deduped.append(root)
+            seen.add(key)
+    return deduped
+
+
+def resolve_fashioniq_root(category: str = None, required_split: str = None) -> Path:
+    for root in _candidate_fashioniq_roots(category):
+        if not _has_fashioniq_layout(root):
+            continue
+        if category and required_split:
+            caption = root / "captions" / f"cap.{category}.{required_split}.json"
+            image_split = root / "image_splits" / f"split.{category}.{required_split}.json"
+            if not caption.exists() or not image_split.exists():
+                continue
+        return root
+
+    searched = ", ".join(str(path) for path in _candidate_fashioniq_roots(category))
+    hint = (
+        "Set CLIP4CIR_FASHIONIQ_ROOT, CLIP4CIR_UWF_ROOT, CLIP4CIR_IDRID_ROOT, "
+        "or CLIP4CIR_DATA_ROOT to point at your dataset directory."
+    )
+    raise FileNotFoundError(f"Could not resolve FashionIQ-format dataset root for {category}. Searched: {searched}. {hint}")
+
+
+def list_fashioniq_categories(split: str = "train") -> List[str]:
+    categories = set()
+    roots = [
+        _env_path("CLIP4CIR_FASHIONIQ_ROOT"),
+        _env_path("CLIP4CIR_UWF_ROOT"),
+        _env_path("CLIP4CIR_IDRID_ROOT"),
+        _data_root() / "UWF_CIR_Dataset_cold",
+        _data_root() / "IDRiD_CIR_Dataset_cold",
+        _data_root() / "fashionIQ_dataset",
+        base_path / "fashionIQ_dataset",
+    ]
+    for root in roots:
+        if root is None or not _has_fashioniq_layout(root):
+            continue
+        for path in (root / "captions").glob(f"cap.*.{split}.json"):
+            categories.add(path.name.split(".")[1])
+    return sorted(categories)
+
 
 def _convert_image_to_rgb(image):
     return image.convert("RGB")
+
+
+class ToClipTensor:
+    """
+    Convert PIL image to tensor compatible with CLIP input conventions.
+
+    - force_rgb=True: convert to RGB first (legacy/default behavior)
+    - force_rgb=False: keep original mode, then coerce tensor to 3 channels
+    """
+
+    def __init__(self, force_rgb: bool = True):
+        self.force_rgb = force_rgb
+
+    def __call__(self, image):
+        if self.force_rgb:
+            image = image.convert("RGB")
+
+        tensor = F.to_tensor(image)
+        if tensor.shape[0] == 1:
+            tensor = tensor.repeat(3, 1, 1)
+        elif tensor.shape[0] > 3:
+            tensor = tensor[:3, :, :]
+        return tensor
 
 
 class SquarePad:
@@ -64,7 +185,7 @@ class TargetPad:
         return F.pad(image, padding, 0, 'constant')
 
 
-def squarepad_transform(dim: int):
+def squarepad_transform(dim: int, force_rgb: bool = True):
     """
     CLIP-like preprocessing transform on a square padded image
     :param dim: image output dimension
@@ -74,27 +195,30 @@ def squarepad_transform(dim: int):
         SquarePad(dim),
         Resize(dim, interpolation=PIL.Image.BICUBIC),
         CenterCrop(dim),
-        _convert_image_to_rgb,
-        ToTensor(),
+        ToClipTensor(force_rgb=force_rgb),
         Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
     ])
 
 
-def targetpad_transform(target_ratio: float, dim: int):
+def targetpad_transform(target_ratio: float, dim: int, force_rgb: bool = True, apply_targetpad: bool = True):
     """
     CLIP-like preprocessing transform computed after using TargetPad pad
     :param target_ratio: target ratio for TargetPad
     :param dim: image output dimension
     :return: CLIP-like torchvision Compose transform
     """
-    return Compose([
-        TargetPad(target_ratio, dim),
+    ops = []
+    if apply_targetpad:
+        ops.append(TargetPad(target_ratio, dim))
+
+    ops.extend([
         Resize(dim, interpolation=PIL.Image.BICUBIC),
         CenterCrop(dim),
-        _convert_image_to_rgb,
-        ToTensor(),
+        ToClipTensor(force_rgb=force_rgb),
         Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
     ])
+
+    return Compose(ops)
 
 
 class FashionIQDataset(Dataset):
@@ -129,31 +253,37 @@ class FashionIQDataset(Dataset):
             raise ValueError("mode should be in ['relative', 'classic']")
         if split not in ['test', 'train', 'val']:
             raise ValueError("split should be in ['test', 'train', 'val']")
-        for dress_type in dress_types:
-            if dress_type not in ['dress', 'shirt', 'toptee', 'CH', 'CO', 'NM', 'RB', 'RCH', 'UM']:        ###############将医学分类缩写（CH, CO, NM, RB, RCH, UM）加入列表
-                raise ValueError("dress_type should be in ['dress', 'shirt', 'toptee', 'CH', ...]")
 
         self.preprocess = preprocess
+        self.dataset_roots = {
+            dress_type: resolve_fashioniq_root(dress_type, split)
+            for dress_type in dress_types
+        }
+        print(
+            "FashionIQ-format dataset roots: "
+            + ", ".join(f"{dress_type}={root}" for dress_type, root in self.dataset_roots.items())
+        )
 
         # get triplets made by (reference_image, target_image, a pair of relative captions)
         self.triplets: List[dict] = []
         for dress_type in dress_types:
-            with open(base_path / 'fashionIQ_dataset' / 'captions' / f'cap.{dress_type}.{split}.json') as f:
+            with open(self.dataset_roots[dress_type] / 'captions' / f'cap.{dress_type}.{split}.json') as f:
                 self.triplets.extend(json.load(f))
 
         # get the image names
         self.image_names: list = []
         for dress_type in dress_types:
-            with open(base_path / 'fashionIQ_dataset' / 'image_splits' / f'split.{dress_type}.{split}.json') as f:
+            with open(self.dataset_roots[dress_type] / 'image_splits' / f'split.{dress_type}.{split}.json') as f:
                 self.image_names.extend(json.load(f))
 
         # --- 修改后的过滤逻辑 ---   
         def get_path(name):
             # 优先检查 .png，其次是 .jpg
-            for ext in ['.png', '.jpg']:
-                p = base_path / 'fashionIQ_dataset' / 'images' / f"{name}{ext}"
-                if os.path.exists(p):
-                    return p
+            for root in self.dataset_roots.values():
+                for ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff']:
+                    p = root / 'images' / f"{name}{ext}"
+                    if os.path.exists(p):
+                        return p
             return None
 
         print("正在校验图片文件是否存在 (自动匹配 .png/.jpg)...")
@@ -178,19 +308,22 @@ class FashionIQDataset(Dataset):
     def __getitem__(self, index):
         # 内部辅助函数，确保能找到正确后缀的文件
         def _get_existing_path(name):
-            for ext in ['.png', '.jpg']:
-                p = base_path / 'fashionIQ_dataset' / 'images' / f"{name}{ext}"
-                if os.path.exists(p): return p
-            raise FileNotFoundError(f"Image {name} not found with .png or .jpg")
+            for root in self.dataset_roots.values():
+                for ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff']:
+                    p = root / 'images' / f"{name}{ext}"
+                    if os.path.exists(p):
+                        return p
+            raise FileNotFoundError(f"Image {name} not found under {[str(root / 'images') for root in self.dataset_roots.values()]}")
 
         try:
             if self.mode == 'relative':
                 # 原本这里是一个列表，例如 ["描述1", "描述2"]
                 raw_captions = self.triplets[index]['captions']
                 
-                # 【修改点】：确保 image_captions 是一个字符串，而不是列表
-                # 既然你只有一条，直接取第一个元素即可
-                image_captions = raw_captions[0] if isinstance(raw_captions, list) else raw_captions
+                # 保持原始列表格式返回，让训练循环自行处理：
+                # - FashionIQ (2条caption): 通过 generate_randomized_fiq_caption() 随机组合
+                # - IDRiD (1条caption): 直接使用
+                image_captions = raw_captions if isinstance(raw_captions, list) else [raw_captions]
 
                 reference_name = self.triplets[index]['candidate']
 

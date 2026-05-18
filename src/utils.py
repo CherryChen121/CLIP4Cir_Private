@@ -29,7 +29,7 @@ def extract_index_features(dataset, clip_model):
         actual_clip = actual_clip.module  # 处理 DataParallel
     
     # 2. 尝试获取维度 (增加对 RetiZero 的兼容)
-    if hasattr(actual_clip, 'visual'):
+    if hasattr(actual_clip, 'visual') and hasattr(actual_clip.visual, 'output_dim'):
         # 官方 CLIP 路径
         feature_dim = actual_clip.visual.output_dim
     elif hasattr(actual_clip, 'retizero'):
@@ -39,11 +39,10 @@ def extract_index_features(dataset, clip_model):
         # 已经剥到了 CLIPRModel 这一层
         feature_dim = actual_clip.vision_model.projection_head_vision.projection.out_features
     else:
-        # 万能保险：如果都找不到，根据你之前的测试结果，强行赋值 512
-        print("⚠️ 无法检测到特征维度，正在使用预设值 512")
-        feature_dim = 512
+        feature_dim = None
 
-    print(f"📊 提取器最终确认维度: {feature_dim}")
+    if feature_dim is not None:
+        print(f"📊 提取器最终确认维度: {feature_dim}")
 
     # 2. 初始化容器为 None
     index_features = None  
@@ -57,7 +56,10 @@ def extract_index_features(dataset, clip_model):
         images = images.to(device, non_blocking=True)
         with torch.no_grad():
             # 这里的 batch_features 是真实跑出来的 [batch_size, 512]
-            batch_features = clip_model(images, mode='image')
+            try:
+                batch_features = clip_model(images, mode='image')
+            except TypeError:
+                batch_features = clip_model.encode_image(images)
             
             # --- 核心黑科技：第一次拿到特征时才建立容器 ---
             if index_features is None:

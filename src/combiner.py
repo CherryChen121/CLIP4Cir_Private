@@ -18,17 +18,18 @@ class Combiner(nn.Module):
         self.text_projection_layer = nn.Linear(clip_feature_dim, projection_dim)
         self.image_projection_layer = nn.Linear(clip_feature_dim, projection_dim)
 
-        self.dropout1 = nn.Dropout(0.5)
-        self.dropout2 = nn.Dropout(0.5)
+        self.dropout1 = nn.Dropout(0.2)
+        self.dropout2 = nn.Dropout(0.2)
 
         self.combiner_layer = nn.Linear(projection_dim * 2, hidden_dim)
         self.output_layer = nn.Linear(hidden_dim, clip_feature_dim)
 
-        self.dropout3 = nn.Dropout(0.5)
+        self.dropout3 = nn.Dropout(0.2)
         self.dynamic_scalar = nn.Sequential(nn.Linear(projection_dim * 2, hidden_dim), nn.ReLU(), nn.Dropout(0.5),
                                             nn.Linear(hidden_dim, 1), nn.Sigmoid())
 
-        self.logit_scale = 100
+        # Keep CLIP-style learnable log temperature.
+        self.logit_scale = nn.Parameter(torch.log(torch.tensor(1 / 0.07)))
 
     # --- src/combiner.py ---
 

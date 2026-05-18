@@ -115,6 +115,27 @@ def generate_cirr_test_dicts(relative_test_dataset: CIRRDataset, clip_model: CLI
     return pairid_to_predictions, pairid_to_group_predictions
 
 
+def _load_optional_clip_weights(clip_model: CLIP, clip_model_path: Path):
+    """Support {'CLIP': ...}, {'state_dict': ...}, and raw OpenAI CLIP state_dict formats."""
+    if not clip_model_path:
+        return
+
+    print('Trying to load the CLIP model')
+    saved_state_dict = torch.load(clip_model_path, map_location=device)
+    if isinstance(saved_state_dict, dict) and "CLIP" in saved_state_dict:
+        clip_weights = saved_state_dict["CLIP"]
+    elif isinstance(saved_state_dict, dict) and "state_dict" in saved_state_dict and isinstance(saved_state_dict["state_dict"], dict):
+        clip_weights = saved_state_dict["state_dict"]
+    else:
+        clip_weights = saved_state_dict
+
+    if any(k.startswith("module.") for k in clip_weights.keys()):
+        clip_weights = {k.replace("module.", "", 1): v for k, v in clip_weights.items()}
+
+    clip_model.load_state_dict(clip_weights, strict=False)
+    print('CLIP model loaded successfully')
+
+
 def generate_cirr_test_predictions(clip_model: CLIP, relative_test_dataset: CIRRDataset, combining_function: callable,
                                    index_names: List[str], index_features: torch.tensor) -> \
         Tuple[torch.tensor, List[str], List[List[str]], List[str]]:
@@ -176,7 +197,8 @@ def main():
     parser.add_argument("--combiner-path", type=str, help="path to trained Combiner")
     parser.add_argument("--projection-dim", default=640 * 4, type=int, help='Combiner projection dim')
     parser.add_argument("--hidden-dim", default=640 * 8, type=int, help="Combiner hidden dim")
-    parser.add_argument("--clip-model-name", default="RN50x4", type=str, help="CLIP model to use, e.g 'RN50', 'RN50x4'")
+    parser.add_argument("--clip-model-name", default="RN50x4", type=str,
+                        help="CLIP model to use, e.g. 'RN50x4', 'ViT-B/32', 'ViT-L/14' (default remains RN50x4)")
     parser.add_argument("--clip-model-path", type=Path, help="Path to the fine-tuned CLIP model")
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
@@ -186,11 +208,7 @@ def main():
     input_dim = clip_model.visual.input_resolution
     feature_dim = clip_model.visual.output_dim
 
-    if args.clip_model_path:
-        print('Trying to load the CLIP model')
-        saved_state_dict = torch.load(args.clip_model_path, map_location=device)
-        clip_model.load_state_dict(saved_state_dict["CLIP"])
-        print('CLIP model loaded successfully')
+    _load_optional_clip_weights(clip_model, args.clip_model_path)
 
     if args.transform == 'targetpad':
         print('Target pad preprocess pipeline is used')
