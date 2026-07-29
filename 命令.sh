@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# CLIP4Cir 训练命令总表（仅保留 5 次并行命令）
+# CLIP4Cir 训练命令总表
 #
 # 说明：
-# 1) 仅保留五次并行命令。
-# 2) 按数据集分为 UWF / IDRiD。
+# 1) Combined 每种配置仅运行 1 次，统一使用 GPU 0。
+# 2) 原有 UWF / IDRiD 命令保持不变。
 # 3) 每个数据集内按 Combiner Training / CLIP Fine-tune 分段。
 # 4) 每段命令前一行注释标明模型。
-# 5) UWF 与 IDRiD 的命令合集完全对称，仅替换 dress-types、GPU、checkpoint 目录与日志前缀。
 # ==============================================================================
 
 # ==============================
@@ -22,6 +21,128 @@ cd /data0/qrchen/projects/CLIP4Cir
 conda activate clip4cir
 export LD_LIBRARY_PATH=/data0/qrchen/miniconda3/envs/clip4cir/lib:${LD_LIBRARY_PATH:-}
 find . -type d -name "__pycache__" -exec rm -rf {} +
+
+# COMBINED_COMMANDS_BEGIN
+# ==============================================================================
+# 0) Combined_Fundus_CIR_Dataset（Internal 训练/验证）
+#
+# 数据根目录：/data0/qrchen/datasets/Combined_Fundus_CIR_Dataset
+# 重复次数：每种配置 1 次
+# GPU：全部使用 GPU 0
+#
+# 重要：本区域是分阶段命令清单，不要整段或整份脚本一次性执行。
+# Phase B 完成并将最佳权重整理到 pretrained_models/Combined/ 后，
+# 才能启动依赖 tuned_* checkpoint 的 Phase C。
+# ==============================================================================
+
+# ------------------------------
+# Phase A: 原始/预训练骨干 + Combiner（8 条）
+# ------------------------------
+
+# 模型：OpenAI CLIP ViT-B/32
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name ViT-B/32 --combiner-lr 2e-5 --batch-size 128 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_vitb32_combiner.log 2>&1 &
+
+# 模型：OpenAI CLIP ViT-L/14
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 768 --hidden-dim 1536 --num-epochs 150 --clip-model-name ViT-L/14 --combiner-lr 2e-5 --batch-size 128 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_vitl14_combiner.log 2>&1 &
+
+# 模型：BMC_CLIP_CF (ViT-L/14)
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 768 --hidden-dim 1536 --num-epochs 150 --clip-model-name ViT-L/14 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/BMC_CLIP_CF.pt --combiner-lr 4e-5 --batch-size 128 --clip-bs 32 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_bmc_clip_cf_combiner.log 2>&1 &
+
+# 模型：OpenAI CLIP RN50x4 (Full FT)
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 2560 --hidden-dim 5120 --num-epochs 150 --clip-model-name RN50x4 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/clip_rn50x4_fullft.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 32 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 1 > run1_combined_rn50x4_combiner.log 2>&1 &
+
+# 模型：OpenAI CLIP RN50x4 (No FT)
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 2560 --hidden-dim 5120 --num-epochs 150 --clip-model-name RN50x4 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/clip_RN50x4_noft.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 32 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 1 > run1_combined_rn50x4_noft_combiner.log 2>&1 &
+
+# 模型：BLIP ITM Large COCO
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 256 --hidden-dim 512 --num-epochs 150 --clip-model-name BLIP --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip_itm_large_coco --blip-model-type BLIP --blip-backend transformers --blip-model-name /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip_itm_large_coco --blip-projection-dim 256 --blip-input-resolution 384 --blip-max-text-len 77 --combiner-lr 4e-5 --batch-size 256 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_blip_combiner.log 2>&1 &
+
+# 模型：BLIP2 ITM ViT-G
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 256 --hidden-dim 512 --num-epochs 150 --clip-model-name BLIP2 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip2_itm_vit_g/model.safetensors --blip-model-type BLIP2 --blip-backend transformers --blip-model-name /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip2_itm_vit_g --blip-projection-dim 256 --blip-input-resolution 364 --blip-max-text-len 77 --combiner-lr 4e-5 --batch-size 256 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_blip2_itm_combiner.log 2>&1 &
+
+# 模型：BLIP2 FLAN-T5-XXL
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 768 --hidden-dim 1536 --num-epochs 150 --clip-model-name BLIP2 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip2-flan-t5-xxl --blip-model-type BLIP2 --blip-backend transformers --blip-model-name /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip2-flan-t5-xxl --blip-projection-dim 768 --blip-input-resolution 224 --blip-max-text-len 77 --combiner-lr 4e-5 --batch-size 128 --clip-bs 8 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_blip2_flan_t5_xxl_combiner.log 2>&1 &
+
+# ------------------------------
+# Phase B: 骨干模型微调（10 条）
+# ------------------------------
+
+# 模型：OpenAI CLIP ViT-B/32
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --num-epochs 150 --clip-model-name ViT-B/32 --encoder both --learning-rate 2e-6 --batch-size 64 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_vitb32_finetune.log 2>&1 &
+
+# 模型：OpenAI CLIP ViT-L/14
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --num-epochs 150 --clip-model-name ViT-L/14 --encoder both --learning-rate 2e-6 --batch-size 64 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_vitl14_finetune.log 2>&1 &
+
+# 模型：BMC_CLIP_CF (ViT-L/14)
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --num-epochs 150 --clip-model-name ViT-L/14 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/BMC_CLIP_CF.pt --encoder both --learning-rate 4e-6 --batch-size 64 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_bmc_clip_cf_finetune.log 2>&1 &
+
+# 模型：OpenAI CLIP RN50x4 (Full FT)
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --num-epochs 150 --clip-model-name RN50x4 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/clip_rn50x4_fullft.pt --encoder both --learning-rate 2e-6 --batch-size 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 1 > run1_combined_rn50x4_finetune.log 2>&1 &
+
+# 模型：OpenAI CLIP RN50x4 (No FT)
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --num-epochs 150 --clip-model-name RN50x4 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/clip_RN50x4_noft.pt --encoder both --learning-rate 2e-6 --batch-size 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 1 > run1_combined_rn50x4_noft_finetune.log 2>&1 &
+
+# 模型：EyeCLIP (ViT-B/32)
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --num-epochs 150 --clip-model-name ViT-B/32 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/eyeclip_clip4cir_vitb32.pt --encoder both --learning-rate 2e-6 --batch-size 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_eyeclip_finetune.log 2>&1 &
+
+# 模型：RETFound (ViT-L/16)
+CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --num-epochs 150 --clip-model-name RETFound --retfound-backbone-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/RETFound_mae_natureCFP.pth --retfound-text-model ViT-L/14 --retfound-projection-dim 768 --encoder both --learning-rate 2e-6 --batch-size 64 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_retfound_finetune.log 2>&1 &
+
+# 模型：BLIP
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --num-epochs 150 --clip-model-name BLIP --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip_itm_large_coco --blip-model-type BLIP --blip-backend transformers --blip-model-name /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip_itm_large_coco --blip-projection-dim 256 --blip-input-resolution 384 --blip-max-text-len 77 --encoder both --learning-rate 2e-6 --batch-size 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_blip_finetune.log 2>&1 &
+
+# 模型：BLIP2 ITM ViT-G
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --num-epochs 150 --clip-model-name BLIP2 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip2_itm_vit_g/model.safetensors --blip-model-type BLIP2 --blip-backend transformers --blip-model-name /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip2_itm_vit_g --blip-projection-dim 256 --blip-input-resolution 364 --blip-max-text-len 77 --encoder both --learning-rate 2e-6 --batch-size 4 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_blip2_itm_finetune.log 2>&1 &
+
+# 模型：BLIP2 FLAN-T5-XXL
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/clip_fine_tune.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --num-epochs 150 --clip-model-name BLIP2 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip2-flan-t5-xxl --blip-model-type BLIP2 --blip-backend transformers --blip-model-name /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip2-flan-t5-xxl --blip-projection-dim 768 --blip-input-resolution 224 --blip-max-text-len 77 --encoder both --learning-rate 2e-6 --batch-size 4 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_blip2_flan_t5_xxl_finetune.log 2>&1 &
+
+# ------------------------------
+# Phase C: 微调后骨干 + Combiner（11 条）
+# ------------------------------
+
+# 模型：OpenAI CLIP ViT-B/32 Fine-tuned
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name ViT-B/32 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/Combined/tuned_vitb32_best.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_vitb32_finetuned_combiner.log 2>&1 &
+
+# 模型：OpenAI CLIP ViT-L/14 Fine-tuned
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 768 --hidden-dim 1536 --num-epochs 150 --clip-model-name ViT-L/14 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/Combined/tuned_vitl14_best.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_vitl14_finetuned_combiner.log 2>&1 &
+
+# 模型：BMC_CLIP_CF Fine-tuned
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 768 --hidden-dim 1536 --num-epochs 150 --clip-model-name ViT-L/14 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/Combined/tuned_bmc_best.pt --combiner-lr 4e-5 --batch-size 128 --clip-bs 32 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_bmc_finetuned_combiner.log 2>&1 &
+
+# 模型：OpenAI CLIP RN50x4 (Full FT) Fine-tuned
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 2560 --hidden-dim 5120 --num-epochs 150 --clip-model-name RN50x4 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/Combined/tuned_clip_best.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 32 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 1 > run1_combined_rn50x4_finetuned_combiner.log 2>&1 &
+
+# 模型：OpenAI CLIP RN50x4 (No FT) Fine-tuned
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 2560 --hidden-dim 5120 --num-epochs 150 --clip-model-name RN50x4 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/Combined/tuned_noft_best.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 32 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 1 > run1_combined_rn50x4_noft_finetuned_combiner.log 2>&1 &
+
+# 模型：RetiZero LoRA Fine-tuned
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name RetiZero --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/Combined/tuned_retizero_best.pth --retizero-base-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/RetiZero.pth --combiner-lr 1e-4 --batch-size 256 --clip-bs 128 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 2 > run1_combined_retizero_lora_finetuned_combiner.log 2>&1 &
+
+# 模型：RETFound Fine-tuned
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 768 --hidden-dim 1536 --num-epochs 150 --clip-model-name RETFound --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/Combined/tuned_retfound_best.pt --retfound-text-model ViT-L/14 --combiner-lr 4e-5 --batch-size 128 --clip-bs 32 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_retfound_finetuned_combiner.log 2>&1 &
+
+# 模型：EyeCLIP Fine-tuned
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 512 --hidden-dim 1024 --num-epochs 150 --clip-model-name ViT-B/32 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/Combined/tuned_eyeclip_best.pt --combiner-lr 2e-5 --batch-size 128 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_eyeclip_finetuned_combiner.log 2>&1 &
+
+# 模型：BLIP Fine-tuned
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 256 --hidden-dim 512 --num-epochs 150 --clip-model-name BLIP --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/Combined/tuned_blip_itm_large_coco_best.pt --blip-model-type BLIP --blip-backend transformers --blip-model-name /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip_itm_large_coco --blip-projection-dim 256 --blip-input-resolution 384 --blip-max-text-len 77 --combiner-lr 4e-5 --batch-size 256 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_blip_finetuned_combiner.log 2>&1 &
+
+# 模型：BLIP2 ITM ViT-G Fine-tuned
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 256 --hidden-dim 512 --num-epochs 150 --clip-model-name BLIP2 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/Combined/tuned_blip2_itm_vit_g_best.pt --blip-model-type BLIP2 --blip-backend transformers --blip-model-name /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip2_itm_vit_g --blip-projection-dim 256 --blip-input-resolution 364 --blip-max-text-len 77 --combiner-lr 4e-5 --batch-size 256 --clip-bs 16 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_blip2_itm_finetuned_combiner.log 2>&1 &
+
+# 模型：BLIP2 FLAN-T5-XXL Fine-tuned
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --dataset FashionIQ --dress-types Internal --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --projection-dim 768 --hidden-dim 1536 --num-epochs 150 --clip-model-name BLIP2 --clip-model-path /data0/qrchen/projects/CLIP4Cir/pretrained_models/Combined/tuned_blip2-flan-t5-xxl_best.pt --blip-model-type BLIP2 --blip-backend transformers --blip-model-name /data0/qrchen/projects/CLIP4Cir/pretrained_models/blip2-flan-t5-xxl --blip-projection-dim 768 --blip-input-resolution 224 --blip-max-text-len 77 --combiner-lr 4e-5 --batch-size 128 --clip-bs 8 --transform targetpad --target-ratio 1.25 --save-training --save-best --validation-frequency 5 > run1_combined_blip2_flan_t5_xxl_finetuned_combiner.log 2>&1 &
+
+# ------------------------------
+# Combined 带真值 test 评估示例（按测试域分别执行）
+# 将模型名、checkpoint 和 combining-function 调整为对应训练产物。
+# ------------------------------
+# CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/validate.py --dataset FashionIQ --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --dress-types Internal --fashioniq-split test --combining-function sum --clip-model-name ViT-B/32 --transform targetpad --target-ratio 1.25 > eval_combined_internal_test.log 2>&1 &
+# CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/validate.py --dataset FashionIQ --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --dress-types ODIR5K --fashioniq-split test --combining-function sum --clip-model-name ViT-B/32 --transform targetpad --target-ratio 1.25 > eval_combined_odir5k_test.log 2>&1 &
+# CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/validate.py --dataset FashionIQ --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --dress-types GRAPE --fashioniq-split test --combining-function sum --clip-model-name ViT-B/32 --transform targetpad --target-ratio 1.25 > eval_combined_grape_test.log 2>&1 &
+
+# COMBINED_COMMANDS_END
 
 
 # ==============================
