@@ -66,12 +66,18 @@ class CLIPRModel(torch.nn.Module):
         return (caption_loss + image_loss) / 2.0
 
     def load_from_pretrained(self, weights_path=None):
-        state_dict = torch.load(weights_path)
+        state_dict = torch.load(weights_path, map_location=device)
+        position_ids_key = "text_model.model.embeddings.position_ids"
+        if position_ids_key not in self.state_dict():
+            state_dict.pop(position_ids_key, None)
         self.load_state_dict(state_dict, strict=True)
         print('load model weight from:', weights_path)
         
     def load_from_pretrained(self, weights_path=None):
-        state_dict = torch.load(weights_path)
+        state_dict = torch.load(weights_path, map_location=device)
+        position_ids_key = "text_model.model.embeddings.position_ids"
+        if position_ids_key not in self.state_dict():
+            state_dict.pop(position_ids_key, None)
         self.load_state_dict(state_dict, strict=True)
         print('load model weight from:', weights_path)
 

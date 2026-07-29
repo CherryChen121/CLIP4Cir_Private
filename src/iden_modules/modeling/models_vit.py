@@ -1,7 +1,8 @@
 import torch
-from iden_modules.modeling import timm_models
+from timm.models.vision_transformer import VisionTransformer as TimmVisionTransformer
 
-class VisionTransformer(timm_models.models.vision_transformer.VisionTransformer):
+
+class VisionTransformer(TimmVisionTransformer):
     """ Vision Transformer with support for global average pooling
     """
     def __init__(self, global_pool=False, **kwargs):
@@ -43,5 +44,4 @@ if __name__ == "__main__":
     output,local_features = net(images,True)
     print(output.shape)
     print(local_features.shape)
-
 

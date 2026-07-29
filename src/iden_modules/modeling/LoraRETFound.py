@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from iden_modules.modeling.models_vit import VisionTransformer
 from functools import partial
-from iden_modules.modeling.timm_models.models.layers import trunc_normal_
+from torch.nn.init import trunc_normal_
 class Identity(nn.Module):
     """Identity layer to replace last fully connected layer"""
     def forward(self, x):

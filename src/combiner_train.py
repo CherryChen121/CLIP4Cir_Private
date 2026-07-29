@@ -108,6 +108,26 @@ def _safe_load_state_dict(model: nn.Module, state_dict: dict, *, context: str):
         f"missing_keys={len(load_result.missing_keys)}, unexpected_keys={len(load_result.unexpected_keys)}"
     )
 
+
+def _load_retizero_for_combiner(kwargs: dict, target_device):
+    try:
+        from src.retizero_adapter import RetiZeroAdapter
+    except ImportError:
+        from retizero_adapter import RetiZeroAdapter
+
+    base_path = kwargs.get("retizero_base_path")
+    if not base_path:
+        raise ValueError(
+            "RetiZero requires --retizero-base-path pointing to RetiZero.pth"
+        )
+
+    model = RetiZeroAdapter(base_path).to(target_device)
+    checkpoint_path = kwargs.get("clip_model_path")
+    if checkpoint_path:
+        model.load_checkpoint(checkpoint_path)
+    return model
+
+
 class CLIPWrapper(nn.Module):
     def __init__(self, clip_model):
         super().__init__()
@@ -274,19 +294,7 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
         ])
     elif "RetiZero" in clip_model_name:
         print("🔧 正在初始化 RetiZero 适配器...")
-        try:
-            from src.retizero_adapter import RetiZeroAdapter
-        except ImportError:
-            from retizero_adapter import RetiZeroAdapter
-        # 优先使用 retizero_base_path 作为 base 权重路径
-        # 如果未指定，则回退到 clip_model_path（兼容旧用法）
-        model_path = kwargs.get("retizero_base_path") or \
-                     kwargs.get("clip_model_path", "pretrained_models/RetiZero.pth")
-        
-        # 1. 实例化适配器
-        clip_model = RetiZeroAdapter(model_path).to(device)
-        
-        # --- src/combiner_train.py ---
+        clip_model = _load_retizero_for_combiner(kwargs, device)
 
         clip_preprocess = transforms.Compose([
             transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
@@ -382,20 +390,7 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
                   (type(clip_model).__name__ == 'RETFoundAdapter')
 
         if is_retizero:
-            # 检查 clip_model_path 是否指向 LoRA 微调 checkpoint
-            clip_model_path = kwargs["clip_model_path"]
-            ckpt_probe = torch.load(clip_model_path, map_location='cpu')
-            is_lora_ckpt = isinstance(ckpt_probe, dict) and 'state_dict' in ckpt_probe and any(
-                k.startswith('img_encoder.') for k in ckpt_probe.get('state_dict', {}).keys()
-            )
-            del ckpt_probe  # 释放内存
-
-            if is_lora_ckpt:
-                print('🔧 检测到 LoRA 微调 checkpoint，正在加载 vision encoder 权重...')
-                clip_model.load_lora_checkpoint(clip_model_path)
-            else:
-                print('✨ [Debug] 身份确认：RetiZero base 模型。')
-                print('✨ 权重已在初始化阶段完成加载，跳过冗余逻辑。')
+            print('✨ [Debug] RetiZero checkpoint 已在初始化阶段完成加载。')
         elif is_retfound:
             print('✨ [Debug] 身份确认：RETFound base 模型。')
             print('✨ 权重已在初始化阶段完成加载，跳过冗余逻辑。')

@@ -121,9 +121,21 @@ def _is_retfound_model_name(model_name: str) -> bool:
     return "RETFound" in str(model_name)
 
 
+def _is_retizero_model_name(model_name: str) -> bool:
+    return "RetiZero" in str(model_name)
+
+
 def _is_blip_model_name(model_name: str) -> bool:
     name = str(model_name).upper()
     return "BLIP" in name
+
+
+def _uses_raw_text_inputs(model_name: str) -> bool:
+    return (
+        _is_blip_model_name(model_name)
+        or _is_retfound_model_name(model_name)
+        or _is_retizero_model_name(model_name)
+    )
 
 
 def _safe_model_tag(model_name: str) -> str:
@@ -206,6 +218,23 @@ def _load_model_for_finetune(clip_model_name: str, kwargs: dict):
             force_rgb=force_rgb,
         )
 
+    if _is_retizero_model_name(clip_model_name):
+        try:
+            from src.retizero_adapter import RetiZeroAdapter
+        except ImportError:
+            from retizero_adapter import RetiZeroAdapter
+
+        base_path = kwargs.get("retizero_base_path") or kwargs.get("clip_model_path")
+        if not base_path:
+            raise ValueError(
+                "RetiZero requires --retizero-base-path pointing to RetiZero.pth"
+            )
+        model = RetiZeroAdapter(base_path)
+        return model, _build_clip_like_preprocess(
+            input_dim=224,
+            force_rgb=force_rgb,
+        )
+
     if _is_retfound_model_name(clip_model_name):
         try:
             from src.retfound_adapter import RETFoundAdapter
@@ -234,6 +263,7 @@ def _maybe_load_custom_clip_weights(clip_model, clip_model_path: str, clip_model
     if (
         not clip_model_path
         or _is_retfound_model_name(clip_model_name)
+        or _is_retizero_model_name(clip_model_name)
         or _is_blip_model_name(clip_model_name)
     ):
         return
@@ -260,6 +290,37 @@ def _maybe_initialize_adapter_for_optimizer(clip_model):
     elif hasattr(clip_model, "diagnostic_summary"):
         print("Adapter diagnostic before optimizer:")
         print(json.dumps(clip_model.diagnostic_summary(), indent=4, ensure_ascii=False))
+
+
+def _configure_finetune_parameters(
+    clip_model: nn.Module,
+    clip_model_name: str,
+    encoder: str,
+):
+    if _is_retizero_model_name(clip_model_name):
+        if encoder != "both":
+            raise ValueError("RetiZero CIR fine-tuning only supports --encoder both")
+        trainable_names = clip_model.configure_cir_finetuning()
+        print(
+            "RetiZero CIR fine-tuning: vision LoRA + vision/text projection heads "
+            f"({len(trainable_names)} tensors)"
+        )
+        return
+
+    if encoder == "text":
+        print("Only the CLIP text encoder will be fine-tuned")
+        for parameter in clip_model.visual.parameters():
+            parameter.requires_grad = False
+    elif encoder == "image":
+        print("Only the CLIP image encoder will be fine-tuned")
+        for parameter in clip_model.parameters():
+            parameter.requires_grad = False
+        for parameter in clip_model.visual.parameters():
+            parameter.requires_grad = True
+    elif encoder == "both":
+        print("Both CLIP encoders will be fine-tuned")
+    else:
+        raise ValueError("encoder parameter should be in ['text', 'image', 'both']")
 
 
 def _trainable_parameter_list(model: nn.Module):
@@ -340,19 +401,7 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
     # 对 ViT 架构启用 gradient checkpointing，节省激活值显存
     enable_grad_checkpointing(clip_model)
 
-    # 1. 设置梯度开关 (保持原逻辑不变)
-    if encoder == 'text':
-        print('Only the CLIP text encoder will be fine-tuned')
-        for param in clip_model.visual.parameters():
-            param.requires_grad = False
-    elif encoder == 'image':
-        print('Only the CLIP image encoder will be fine-tuned')
-        for param in clip_model.parameters():
-            param.requires_grad = False
-        for param in clip_model.visual.parameters():
-            param.requires_grad = True
-    elif encoder == 'both':
-        print('Both CLIP encoders will be fine-tuned')
+    _configure_finetune_parameters(clip_model, clip_model_name, encoder)
 
     clip_model = clip_model.to(device)
     _maybe_initialize_adapter_for_optimizer(clip_model)
@@ -479,7 +528,7 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
                     flattened_captions = list(captions)
 
                 # 2. 直接进行 Tokenize，不再经过 generate_randomized_fiq_caption
-                if _is_blip_model_name(clip_model_name) or _is_retfound_model_name(clip_model_name):
+                if _uses_raw_text_inputs(clip_model_name):
                     text_inputs = flattened_captions
                 else:
                     text_inputs = clip.tokenize(flattened_captions, context_length=77, truncate=True).to(device, non_blocking=True)
@@ -624,20 +673,7 @@ def clip_finetune_cirr(num_epochs: int, clip_model_name: str, learning_rate: flo
     # 对 ViT 架构启用 gradient checkpointing，节省激活值显存
     enable_grad_checkpointing(clip_model)
 
-    if encoder == 'text':
-        print('Only the CLIP text encoder will be fine-tuned')
-        for param in clip_model.visual.parameters():
-            param.requires_grad = False
-    elif encoder == 'image':
-        print('Only the CLIP image encoder will be fine-tuned')
-        for param in clip_model.parameters():
-            param.requires_grad = False
-        for param in clip_model.visual.parameters():
-            param.requires_grad = True
-    elif encoder == 'both':
-        print('Both CLIP encoders will be fine-tuned')
-    else:
-        raise ValueError("encoder parameter should be in ['text', 'image', both']")
+    _configure_finetune_parameters(clip_model, clip_model_name, encoder)
 
     clip_model = clip_model.to(device)
     _maybe_initialize_adapter_for_optimizer(clip_model)
@@ -721,7 +757,7 @@ def clip_finetune_cirr(num_epochs: int, clip_model_name: str, learning_rate: flo
                 # Extract the features, compute the logits and the loss
                 with torch.cuda.amp.autocast():
                     reference_features = clip_model.encode_image(reference_images)
-                    if _is_blip_model_name(clip_model_name) or _is_retfound_model_name(clip_model_name):
+                    if _uses_raw_text_inputs(clip_model_name):
                         text_inputs = list(captions)
                     else:
                         text_inputs = clip.tokenize(captions, context_length=77, truncate=True).to(
@@ -858,6 +894,8 @@ if __name__ == '__main__':
                         help="Save only the best model during training")
     parser.add_argument("--clip-model-path", type=str, default=None,
                         help="Path to a custom CLIP checkpoint (e.g. BMC_CLIP_CF.pt) to load on top of the base architecture")
+    parser.add_argument("--retizero-base-path", type=str, default=None,
+                        help="Path to the base RetiZero.pth checkpoint")
     parser.add_argument("--retfound-backbone-path", type=str, default=None,
                         help="Path to RETFound backbone checkpoint (e.g. RETFound_mae_natureCFP.pth)")
     parser.add_argument("--retfound-text-model", type=str, default="ViT-L/14",
@@ -905,6 +943,7 @@ if __name__ == '__main__':
         "encoder": args.encoder,
         "save_best": args.save_best,
         "clip_model_path": args.clip_model_path,
+        "retizero_base_path": args.retizero_base_path,
         "retfound_backbone_path": args.retfound_backbone_path,
         "retfound_text_model": args.retfound_text_model,
         "retfound_projection_dim": args.retfound_projection_dim,
