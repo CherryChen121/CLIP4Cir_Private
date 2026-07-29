@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -357,6 +358,37 @@ def test_second_final_probe_becoming_busy_cancels_launch(tmp_path):
     assert launcher.assignments == []
 
 
+def test_launch_failure_pauses_queue_without_marking_task_running(tmp_path):
+    class FailingLauncher(DispatcherLauncher):
+        def start(self, task, gpu, task_dir):
+            raise ProcessIdentityError("worker disappeared")
+
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    dispatcher = Dispatcher(
+        queue=queue,
+        state=state,
+        run_dir=tmp_path,
+        probe=StaticProbe(_eight_snapshots()),
+        idle_policy=EligiblePolicy([2]),
+        launcher=FailingLauncher(),
+        proc_inspector=Descendants(),
+        state_store=MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "launch-time",
+    )
+
+    dispatcher.run_cycle(sample_idle=True)
+
+    assert state["paused_reason"] == {
+        "kind": "launch_error",
+        "task_id": "A01",
+        "detail": "worker disappeared",
+        "detected_at": "launch-time",
+    }
+    assert next(task for task in state["tasks"] if task["task_id"] == "A01")["status"] == "pending"
+
+
 def test_unknown_compute_pid_pauses_and_stops_only_owned_task(tmp_path):
     queue = _queue()
     state = initial_state(queue, "run-1", "created")
@@ -559,3 +591,37 @@ def test_shell_wrapper_rejects_unknown_mode():
 
     assert completed.returncode == 2
     assert "Usage:" in completed.stderr
+
+
+def test_script_entrypoint_defines_probe_before_running_dry_run(tmp_path):
+    project_root = Path(__file__).resolve().parents[1]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_nvidia_smi = fake_bin / "nvidia-smi"
+    fake_nvidia_smi.write_text(
+        """#!/usr/bin/env bash
+if [[ "$1" == --query-gpu=* ]]; then
+  for index in 0 1 2 3 4 5 6 7; do
+    echo "${index}, GPU-${index}, 0, 0"
+  done
+fi
+""",
+        encoding="utf-8",
+    )
+    fake_nvidia_smi.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["PYTHONPATH"] = str(project_root / "src")
+
+    completed = subprocess.run(
+        [sys.executable, "src/combined_gpu_queue.py", "--dry-run"],
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "dry-run only" in completed.stdout
+    assert "NameError" not in completed.stderr

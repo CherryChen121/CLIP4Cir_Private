@@ -390,11 +390,21 @@ class Dispatcher:
             if final_gpu is None:
                 continue
             spec = self._task_specs[pending["task_id"]]
-            launch = self.launcher.start(
-                spec,
-                final_gpu,
-                self.run_dir / "tasks" / spec.task_id,
-            )
+            try:
+                launch = self.launcher.start(
+                    spec,
+                    final_gpu,
+                    self.run_dir / "tasks" / spec.task_id,
+                )
+            except (OSError, ProcessIdentityError, ValueError) as exc:
+                self.state["paused_reason"] = {
+                    "kind": "launch_error",
+                    "task_id": spec.task_id,
+                    "detail": str(exc),
+                    "detected_at": self.now(),
+                }
+                self._save()
+                return
             mark_running(
                 self.state,
                 spec.task_id,
@@ -570,14 +580,6 @@ def main(argv=None, dependencies=None) -> int:
         return dispatcher.run_forever()
 
 
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except (AlreadyRunningError, ProbeError, ResumeError) as exc:
-        print(f"dispatcher error: {exc}")
-        raise SystemExit(2)
-
-
 class NvidiaSmiProbe:
     GPU_QUERY = [
         "nvidia-smi",
@@ -656,3 +658,11 @@ class NvidiaSmiProbe:
             )
             for index in range(8)
         )
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (AlreadyRunningError, ProbeError, ResumeError) as exc:
+        print(f"dispatcher error: {exc}")
+        raise SystemExit(2)
