@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from data_utils import squarepad_transform, FashionIQDataset, targetpad_transform, CIRRDataset
 from combiner import Combiner
+from fashioniq_evaluation import compute_recall_at_k
 from utils import extract_index_features, collate_fn, element_wise_sum, device
 
 
@@ -95,30 +96,13 @@ def compute_fiq_val_metrics(relative_val_dataset: FashionIQDataset, clip_model: 
 
     print(f"Compute FashionIQ {relative_val_dataset.dress_types} validation metrics (R@1, R@5, R@10)")
 
-    # 2. 归一化索引特征 (确保在单位球面上计算余弦相似度)
-    index_features = F.normalize(index_features, dim=-1).float()
-
-    # 3. 计算余弦距离 (1 - similarity) 并排序
-    # predicted_features 形状: [N_queries, Dim], index_features.T 形状: [Dim, N_index]
-    distances = 1 - predicted_features @ index_features.T
-    sorted_indices = torch.argsort(distances, dim=-1).cpu()
-    sorted_index_names = np.array(index_names)[sorted_indices]
-
-    # 4. 生成 Ground-truth 标签矩阵
-    # 每一行代表一个查询，如果排序后的名称等于目标名称，则该位置为 True
-    labels = torch.tensor(
-        sorted_index_names == np.repeat(np.array(target_names), len(index_names)).reshape(len(target_names), -1))
-    
-    # 安全校验：确保每个查询在库中都有且仅有一个对应的目标图
-    assert torch.equal(torch.sum(labels, dim=-1).int(), torch.ones(len(target_names)).int())
-
-    # 5. 计算核心指标 (摒弃无意义的 R@50)
-    # 计算逻辑：在前 K 名中发现 True 的样本数 / 总查询数
-    recall_at1 = (torch.sum(labels[:, :1]) / len(labels)).item() * 100
-    recall_at5 = (torch.sum(labels[:, :5]) / len(labels)).item() * 100
-    recall_at10 = (torch.sum(labels[:, :10]) / len(labels)).item() * 100
-
-    return recall_at1, recall_at5, recall_at10
+    return compute_recall_at_k(
+        predicted_features,
+        target_names,
+        index_features,
+        index_names,
+        ks=(1, 5, 10),
+    )
 
 
 def generate_fiq_val_predictions(clip_model: nn.Module, relative_val_dataset: FashionIQDataset,
@@ -174,7 +158,9 @@ def generate_fiq_val_predictions(clip_model: nn.Module, relative_val_dataset: Fa
 
     return predicted_features, target_names
 
-def fashioniq_val_retrieval(dress_type: str, combining_function: callable, clip_model: CLIP, preprocess: callable):
+def fashioniq_val_retrieval(
+        dress_type: str, combining_function: callable, clip_model: CLIP,
+        preprocess: callable, split: str = "val", dataset_root=None):
     """
     Perform retrieval on FashionIQ validation set computing the metrics. To combine the features the `combining_function`
     is used
@@ -187,10 +173,18 @@ def fashioniq_val_retrieval(dress_type: str, combining_function: callable, clip_
 
     clip_model = clip_model.float().eval()
 
-    # Define the validation datasets and extract the index features
-    classic_val_dataset = FashionIQDataset('val', [dress_type], 'classic', preprocess)
+    # Define the labeled evaluation datasets and extract the index features
+    classic_val_dataset = FashionIQDataset(
+        split, [dress_type], 'classic', preprocess, dataset_root=dataset_root)
     index_features, index_names = extract_index_features(classic_val_dataset, clip_model)
-    relative_val_dataset = FashionIQDataset('val', [dress_type], 'relative', preprocess)
+    relative_val_dataset = FashionIQDataset(
+        split,
+        [dress_type],
+        'relative',
+        preprocess,
+        dataset_root=dataset_root,
+        return_target=(split == "test"),
+    )
 
     return compute_fiq_val_metrics(relative_val_dataset, clip_model, index_features, index_names,
                                    combining_function)
@@ -357,6 +351,24 @@ def main():
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
                         help="Preprocess pipeline, should be in ['clip', 'squarepad', 'targetpad'] ")
+    parser.add_argument(
+        "--fashioniq-root",
+        type=str,
+        default=None,
+        help="Explicit root for a FashionIQ-style dataset; overrides root auto-discovery",
+    )
+    parser.add_argument(
+        "--dress-types",
+        nargs="+",
+        default=None,
+        help="FashionIQ-format categories to evaluate",
+    )
+    parser.add_argument(
+        "--fashioniq-split",
+        choices=("val", "test"),
+        default="val",
+        help="Labeled FashionIQ-format split to evaluate",
+    )
 
     args = parser.parse_args()
 
@@ -425,14 +437,26 @@ def main():
         average_recall10_list = []
 
         from data_utils import list_fashioniq_categories
-        valid_dress_types = list_fashioniq_categories("val")
+        valid_dress_types = args.dress_types or list_fashioniq_categories(
+            args.fashioniq_split, args.fashioniq_root)
         
         # fallback if not found
         if not valid_dress_types:
+            if args.fashioniq_root:
+                raise FileNotFoundError(
+                    f"No FashionIQ-format categories found for split "
+                    f"{args.fashioniq_split} under {args.fashioniq_root}")
             valid_dress_types = ['shirt', 'dress', 'toptee']
 
         for dt in valid_dress_types:
-            r1, r5, r10 = fashioniq_val_retrieval(dt, combining_function, clip_model, preprocess)
+            r1, r5, r10 = fashioniq_val_retrieval(
+                dt,
+                combining_function,
+                clip_model,
+                preprocess,
+                split=args.fashioniq_split,
+                dataset_root=args.fashioniq_root,
+            )
             average_recall1_list.append(r1)
             average_recall5_list.append(r5)
             average_recall10_list.append(r10)
