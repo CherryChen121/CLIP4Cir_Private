@@ -244,3 +244,200 @@ def preflight_queue(queue: QueueSpec, project_root: Path) -> None:
 
     if errors:
         raise PreflightError("\n".join(errors))
+
+
+SCHEMA_VERSION = 1
+TERMINAL_STATUSES = {"succeeded", "failed", "conflict_stopped", "interrupted"}
+
+
+def initial_state(
+    queue: QueueSpec,
+    run_id: str,
+    created_at: str,
+) -> dict:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run_id,
+        "created_at": created_at,
+        "command_sha256": queue.command_sha256,
+        "paused_reason": None,
+        "tasks": [
+            {
+                "task_id": task.task_id,
+                "phase": task.phase,
+                "ordinal": task.ordinal,
+                "argv": list(task.argv),
+                "env": dict(task.env),
+                "log_name": task.log_name,
+                "status": "pending",
+                "gpu_index": None,
+                "gpu_uuid": None,
+                "pid": None,
+                "pgid": None,
+                "start_ticks": None,
+                "process_command_sha256": None,
+                "manifest_path": None,
+                "result_path": None,
+                "log_path": None,
+                "started_at": None,
+                "ended_at": None,
+                "return_code": None,
+                "conflict": None,
+            }
+            for task in queue.tasks
+        ],
+    }
+
+
+def _state_task(state: dict, task_id: str) -> dict:
+    matches = [task for task in state["tasks"] if task["task_id"] == task_id]
+    if len(matches) != 1:
+        raise ResumeError(f"state has invalid task id: {task_id}")
+    return matches[0]
+
+
+def next_pending_task(state: dict) -> Optional[dict]:
+    if state.get("paused_reason"):
+        return None
+    phase_a = [task for task in state["tasks"] if task["phase"] == "A"]
+    phase_b = [task for task in state["tasks"] if task["phase"] == "B"]
+    if not all(task["status"] == "succeeded" for task in phase_a):
+        candidates = [task for task in phase_a if task["status"] == "pending"]
+    else:
+        candidates = [task for task in phase_b if task["status"] == "pending"]
+    return min(candidates, key=lambda item: item["ordinal"]) if candidates else None
+
+
+def mark_running(
+    state: dict,
+    task_id: str,
+    launch: dict,
+    gpu: GpuSnapshot,
+    started_at: str,
+) -> None:
+    task = _state_task(state, task_id)
+    if task["status"] != "pending":
+        raise ResumeError(f"task {task_id} is not pending")
+    task.update(
+        {
+            "status": "running",
+            "gpu_index": gpu.index,
+            "gpu_uuid": gpu.uuid,
+            "pid": launch["pid"],
+            "pgid": launch["pgid"],
+            "start_ticks": launch["start_ticks"],
+            "process_command_sha256": launch["command_sha256"],
+            "manifest_path": launch["manifest_path"],
+            "result_path": launch["result_path"],
+            "log_path": launch["log_path"],
+            "started_at": started_at,
+        }
+    )
+
+
+def record_exit(state: dict, task_id: str, return_code: int, ended_at: str) -> None:
+    task = _state_task(state, task_id)
+    if task["status"] != "running":
+        raise ResumeError(f"task {task_id} is not running")
+    task["return_code"] = int(return_code)
+    task["ended_at"] = ended_at
+    task["status"] = "succeeded" if return_code == 0 else "failed"
+    if return_code != 0 and not state.get("paused_reason"):
+        state["paused_reason"] = {
+            "kind": "task_failed",
+            "task_id": task_id,
+            "return_code": int(return_code),
+            "detected_at": ended_at,
+        }
+
+
+def record_conflict(
+    state: dict,
+    task_id: str,
+    unknown_pids: Sequence[int],
+    detected_at: str,
+    owners: Optional[Dict[int, str]] = None,
+) -> None:
+    task = _state_task(state, task_id)
+    task["status"] = "conflict_stopped"
+    task["ended_at"] = detected_at
+    task["conflict"] = {
+        "unknown_pids": sorted(int(pid) for pid in unknown_pids),
+        "owners": {str(pid): owner for pid, owner in (owners or {}).items()},
+    }
+    state["paused_reason"] = {
+        "kind": "foreign_gpu_process",
+        "task_id": task_id,
+        "unknown_pids": sorted(int(pid) for pid in unknown_pids),
+        "detected_at": detected_at,
+    }
+
+
+def record_interrupted(state: dict, task_id: str, detected_at: str) -> None:
+    task = _state_task(state, task_id)
+    task["status"] = "interrupted"
+    task["ended_at"] = detected_at
+    state["paused_reason"] = {
+        "kind": "process_identity_unverified",
+        "task_id": task_id,
+        "detected_at": detected_at,
+    }
+
+
+def validate_resume_state(state: dict, queue: QueueSpec) -> None:
+    if state.get("schema_version") != SCHEMA_VERSION:
+        raise ResumeError("unsupported state schema version")
+    if state.get("command_sha256") != queue.command_sha256:
+        raise ResumeError("command digest changed")
+    expected = {
+        task.task_id: (
+            task.phase,
+            task.ordinal,
+            list(task.argv),
+            task.env,
+            task.log_name,
+        )
+        for task in queue.tasks
+    }
+    actual = {}
+    for task in state.get("tasks", []):
+        task_id = task.get("task_id")
+        if task_id in actual:
+            raise ResumeError(f"duplicate task in state: {task_id}")
+        actual[task_id] = (
+            task.get("phase"),
+            task.get("ordinal"),
+            task.get("argv"),
+            task.get("env"),
+            task.get("log_name"),
+        )
+    if actual != expected:
+        raise ResumeError("state task definitions do not match queue")
+
+
+class AtomicStateStore:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def load(self) -> dict:
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ResumeError(f"cannot load state: {exc}") from exc
+
+    def save(self, state: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+            dir=str(self.path.parent),
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, self.path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)

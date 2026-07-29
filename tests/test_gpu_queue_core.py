@@ -3,14 +3,21 @@ from pathlib import Path
 import pytest
 
 from gpu_queue_core import (
+    AtomicStateStore,
     PreflightError,
     GpuSnapshot,
     IdlePolicy,
     ProbeError,
     QueueSpec,
+    ResumeError,
     TaskSpec,
+    initial_state,
+    mark_running,
+    next_pending_task,
     parse_combined_queue,
     preflight_queue,
+    record_exit,
+    validate_resume_state,
 )
 
 
@@ -189,3 +196,83 @@ def test_idle_policy_rejects_gpu_uuid_mapping_change():
 
     with pytest.raises(ProbeError, match="UUID mapping"):
         policy.observe(tuple(changed))
+
+
+def _small_queue(digest="queue-digest"):
+    tasks = []
+    for phase in ("A", "B"):
+        for ordinal in (1, 2):
+            tasks.append(
+                TaskSpec(
+                    task_id=f"{phase}{ordinal:02d}",
+                    phase=phase,
+                    ordinal=ordinal,
+                    argv=(str(PYTHON), "src/combiner_train.py", "--dataset", "FashionIQ"),
+                    env={"CUDA_VISIBLE_DEVICES": "0", "NCCL_P2P_DISABLE": "1"},
+                    log_name=f"{phase.lower()}{ordinal}.log",
+                    source=f"{phase}{ordinal}",
+                )
+            )
+    return QueueSpec(tuple(tasks), digest)
+
+
+def _launch():
+    return {
+        "pid": 101,
+        "pgid": 101,
+        "start_ticks": 12345,
+        "command_sha256": "worker-command",
+        "manifest_path": "/tmp/A01/manifest.json",
+        "result_path": "/tmp/A01/result.json",
+        "log_path": "/tmp/A01/task.log",
+    }
+
+
+def _task_state(state, task_id):
+    return next(task for task in state["tasks"] if task["task_id"] == task_id)
+
+
+def test_phase_b_is_blocked_until_every_phase_a_task_succeeds():
+    state = initial_state(_small_queue(), "run-1", "2026-07-30T00:00:00")
+    gpu = GpuSnapshot(0, "GPU-0", 0, 0, ())
+
+    assert next_pending_task(state)["task_id"] == "A01"
+    mark_running(state, "A01", _launch(), gpu, "start")
+    record_exit(state, "A01", 0, "end")
+    assert next_pending_task(state)["task_id"] == "A02"
+    mark_running(state, "A02", _launch(), gpu, "start")
+    record_exit(state, "A02", 0, "end")
+
+    assert next_pending_task(state)["task_id"] == "B01"
+
+
+def test_nonzero_exit_pauses_new_dispatch_but_keeps_other_task_running():
+    state = initial_state(_small_queue(), "run-1", "created")
+    gpu0 = GpuSnapshot(0, "GPU-0", 0, 0, ())
+    gpu1 = GpuSnapshot(1, "GPU-1", 0, 0, ())
+    mark_running(state, "A01", _launch(), gpu0, "start")
+    second_launch = dict(_launch(), pid=202, pgid=202)
+    mark_running(state, "A02", second_launch, gpu1, "start")
+
+    record_exit(state, "A01", 7, "end")
+
+    assert state["paused_reason"]["kind"] == "task_failed"
+    assert _task_state(state, "A02")["status"] == "running"
+    assert next_pending_task(state) is None
+
+
+def test_atomic_state_store_replaces_complete_json(tmp_path):
+    path = tmp_path / "state.json"
+    store = AtomicStateStore(path)
+
+    store.save({"schema_version": 1, "tasks": []})
+
+    assert store.load() == {"schema_version": 1, "tasks": []}
+    assert list(tmp_path.glob(".state.json.*.tmp")) == []
+
+
+def test_resume_rejects_changed_command_digest():
+    state = initial_state(_small_queue("old"), "run-1", "created")
+
+    with pytest.raises(ResumeError, match="command digest"):
+        validate_resume_state(state, _small_queue("new"))
