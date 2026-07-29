@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import os
 from iden_modules import CLIPRModel
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer
 
 class RetiZeroAdapter(nn.Module):
     def __init__(self, model_path):
@@ -23,13 +23,34 @@ class RetiZeroAdapter(nn.Module):
         print(f"🔄 正在加载 RetiZero 权重: {model_path}")
         self.retizero = CLIPRModel(vision_type="lora", weights_path=model_path)
         
-        # 4. 【接口伪装】手动挂载 .visual 属性，对齐 CLIP4Cir 接口
-        self.visual = type('', (), {})() 
-        self.visual.input_resolution = 224
-        self.visual.output_dim = 512 
+        # 4. 在真实 vision module 上补齐 CLIP4Cir 所需的元数据。
+        self.retizero.vision_model.input_resolution = 224
+        self.retizero.vision_model.output_dim = 512
         
         # 5. 设置温度系数 (CLIP 相似度计算必用)
         self.logit_scale = nn.Parameter(torch.ones([]) * 2.6592)
+
+    @property
+    def visual(self):
+        """Expose the real vision module through CLIP's conventional interface."""
+        return self.retizero.vision_model
+
+    def configure_cir_finetuning(self):
+        """Train only vision LoRA weights and the two multimodal projection heads."""
+        self.requires_grad_(False)
+
+        vision_backbone = self.retizero.vision_model.model
+        for layer in [*vision_backbone.w_As, *vision_backbone.w_Bs]:
+            layer.requires_grad_(True)
+
+        self.retizero.vision_model.projection_head_vision.requires_grad_(True)
+        self.retizero.text_model.projection_head_text.requires_grad_(True)
+
+        return [
+            name
+            for name, parameter in self.named_parameters()
+            if parameter.requires_grad
+        ]
 
     def encode_image(self, image):
         # 修正：加上 .retizero 前缀
@@ -57,40 +78,68 @@ class RetiZeroAdapter(nn.Module):
         
         # 4. 归一化
         return features / features.norm(dim=-1, keepdim=True)
+    @staticmethod
+    def _strip_wrapper_prefixes(state_dict):
+        cleaned = {}
+        for key, value in state_dict.items():
+            while key.startswith("module.") or key.startswith("clip_model."):
+                if key.startswith("module."):
+                    key = key[len("module."):]
+                elif key.startswith("clip_model."):
+                    key = key[len("clip_model."):]
+            cleaned[key] = value
+        return cleaned
+
+    def load_checkpoint(self, checkpoint_path):
+        """Load either a native CLIP4Cir adapter or a legacy classifier LoRA checkpoint."""
+        print(f"🔄 正在加载 RetiZero checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        if not isinstance(checkpoint, dict):
+            raise ValueError(
+                f"Unsupported RetiZero checkpoint object: {type(checkpoint).__name__}"
+            )
+
+        epoch = checkpoint.get("epoch", -1)
+        if isinstance(checkpoint.get("RetiZeroAdapter"), dict):
+            adapter_state = self._strip_wrapper_prefixes(
+                checkpoint["RetiZeroAdapter"]
+            )
+            self.load_state_dict(adapter_state, strict=True)
+            metric = checkpoint.get("average_recall", -1)
+            print(
+                "  ✅ 已恢复完整 RetiZeroAdapter "
+                f"(epoch={epoch}, average_recall={metric})"
+            )
+            return epoch, metric
+
+        legacy_state = checkpoint.get("state_dict")
+        if isinstance(legacy_state, dict):
+            vision_state = {
+                key[len("img_encoder."):]: value
+                for key, value in legacy_state.items()
+                if key.startswith("img_encoder.")
+            }
+            if vision_state:
+                self.retizero.vision_model.model.load_state_dict(
+                    vision_state,
+                    strict=True,
+                )
+                metric = checkpoint.get("mean_ACC", -1)
+                print(
+                    "  ✅ 已加载旧版分类 LoRA vision 权重 "
+                    f"(epoch={epoch}, mean_ACC={metric})"
+                )
+                return epoch, metric
+
+        keys = ", ".join(sorted(str(key) for key in checkpoint.keys()))
+        raise ValueError(
+            "Unsupported RetiZero checkpoint format. "
+            f"Expected 'RetiZeroAdapter' or legacy 'state_dict/img_encoder.*'; got keys: {keys}"
+        )
+
     def load_lora_checkpoint(self, lora_checkpoint_path):
-        """
-        加载 LoRA 微调后的 vision encoder 权重。
-        
-        LoRA checkpoint 来自 RetiZero/Finetuning.py 保存的 Model_Finetuing 模型，
-        其 state_dict 包含:
-          - img_encoder.*  → 对应 CLIPRModel.vision_model.model.*
-          - classifier.*   → 分类头（CIR 任务不需要）
-        
-        :param lora_checkpoint_path: LoRA checkpoint .pth 文件路径
-        """
-        print(f"🔄 正在加载 LoRA 微调权重: {lora_checkpoint_path}")
-        ckpt = torch.load(lora_checkpoint_path, map_location='cpu')
-        lora_state_dict = ckpt['state_dict']
-        ckpt_epoch = ckpt.get('epoch', -1)
-        ckpt_acc = ckpt.get('mean_ACC', -1)
-        print(f"  Checkpoint info: epoch={ckpt_epoch}, val_acc={ckpt_acc:.4f}")
-
-        # 提取并重映射 vision encoder 权重: img_encoder.xxx → xxx
-        vision_state_dict = {}
-        skipped = 0
-        for k, v in lora_state_dict.items():
-            if k.startswith('img_encoder.'):
-                vision_state_dict[k.replace('img_encoder.', '')] = v
-            else:
-                skipped += 1
-
-        print(f"  提取到 {len(vision_state_dict)} 个 vision 权重, 跳过 {skipped} 个 (classifier 等)")
-
-        # 替换 vision model 权重（text model 保持 base 不变）
-        load_result = self.retizero.vision_model.model.load_state_dict(vision_state_dict, strict=True)
-        print(f"  ✅ LoRA vision 权重加载完成: missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}")
-
-        return ckpt_epoch, ckpt_acc
+        """Backward-compatible alias for legacy callers."""
+        return self.load_checkpoint(lora_checkpoint_path)
     # 在 RetiZeroAdapter 类内部添加这个方法
     def forward(self, x, mode):
         """
