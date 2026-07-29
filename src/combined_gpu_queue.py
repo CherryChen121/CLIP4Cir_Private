@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -10,35 +12,54 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Optional, Tuple
 
 try:
     from gpu_queue_core import (
+        AtomicStateStore,
         GpuSnapshot,
+        IdlePolicy,
         ProbeError,
         QueueSpec,
+        ResumeError,
         TaskSpec,
+        initial_state,
         mark_running,
         next_pending_task,
+        parse_combined_queue,
+        preflight_queue,
         record_conflict,
         record_exit,
         record_interrupted,
+        validate_resume_state,
     )
 except ImportError:
     from src.gpu_queue_core import (
+        AtomicStateStore,
         GpuSnapshot,
+        IdlePolicy,
         ProbeError,
         QueueSpec,
+        ResumeError,
         TaskSpec,
+        initial_state,
         mark_running,
         next_pending_task,
+        parse_combined_queue,
+        preflight_queue,
         record_conflict,
         record_exit,
         record_interrupted,
+        validate_resume_state,
     )
 
 
 class ProcessIdentityError(RuntimeError):
+    pass
+
+
+class AlreadyRunningError(RuntimeError):
     pass
 
 
@@ -398,6 +419,163 @@ class Dispatcher:
                 return 0
             cycle += 1
             self.sleeper(30)
+
+
+class DispatcherLock:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._handle = None
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.seek(0)
+            owner = handle.read().strip() or "unknown"
+            handle.close()
+            raise AlreadyRunningError(f"dispatcher already running (PID {owner})") from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+        self._handle = handle
+
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        self._handle.close()
+        self._handle = None
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.release()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Safely dispatch Combined Phase A/B jobs to audited idle GPUs."
+    )
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--dry-run", action="store_true")
+    modes.add_argument("--run", action="store_true")
+    modes.add_argument("--resume", type=Path, metavar="RUN_DIR")
+    return parser
+
+
+def _default_dependencies():
+    project_root = Path(__file__).resolve().parents[1]
+    return SimpleNamespace(
+        project_root=project_root,
+        command_file=project_root / "命令.sh",
+        python_executable=Path("/data0/qrchen/miniconda3/envs/clip4cir/bin/python"),
+        runtime_root=project_root / "gpu_queue_runs",
+        probe=NvidiaSmiProbe(),
+        output=print,
+    )
+
+
+def _audit_line(gpu: GpuSnapshot) -> str:
+    reasons = []
+    if gpu.compute_pids:
+        reasons.append(f"compute_pids={','.join(str(pid) for pid in gpu.compute_pids)}")
+    if gpu.memory_used_mib > 512:
+        reasons.append(f"memory={gpu.memory_used_mib}MiB")
+    if gpu.utilization_percent > 5:
+        reasons.append(f"utilization={gpu.utilization_percent}%")
+    status = "unavailable" if reasons else "idle-now (needs 5 consecutive samples)"
+    detail = "; ".join(reasons) if reasons else "no compute PID; memory/utilization within limits"
+    return f"GPU {gpu.index} {gpu.uuid}: {status}; {detail}"
+
+
+def _event_logger(path: Path, output):
+    def log(message: str):
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        line = f"{timestamp} {message}"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        output(line)
+
+    return log
+
+
+def main(argv=None, dependencies=None) -> int:
+    args = build_parser().parse_args(argv)
+    deps = dependencies or _default_dependencies()
+    queue = parse_combined_queue(
+        deps.command_file,
+        deps.project_root,
+        deps.python_executable,
+    )
+    preflight_queue(queue, deps.project_root)
+
+    if args.dry_run:
+        snapshots = deps.probe.snapshot()
+        deps.output(
+            f"preflight ok: {len(queue.tasks)} commands "
+            f"(Phase A=10, Phase B=10), digest={queue.command_sha256}"
+        )
+        for gpu in snapshots:
+            deps.output(_audit_line(gpu))
+        deps.output("dry-run only: no state created and no training process launched")
+        return 0
+
+    runtime_root = Path(deps.runtime_root)
+    lock = DispatcherLock(runtime_root / "dispatcher.lock")
+    with lock:
+        if args.run:
+            run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+            run_dir = runtime_root / run_id
+            run_dir.mkdir(parents=True, exist_ok=False)
+            state = initial_state(
+                queue,
+                run_id,
+                time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            )
+            store = AtomicStateStore(run_dir / "state.json")
+            store.save(state)
+        else:
+            run_dir = args.resume.resolve()
+            store = AtomicStateStore(run_dir / "state.json")
+            state = store.load()
+            validate_resume_state(state, queue)
+
+        logger = _event_logger(run_dir / "dispatcher.log", deps.output)
+        inspector = ProcInspector()
+        launcher = OwnedProcessLauncher(
+            project_root=deps.project_root,
+            python_executable=deps.python_executable,
+            worker_script=deps.project_root / "src/gpu_queue_worker.py",
+            proc_inspector=inspector,
+        )
+        dispatcher = Dispatcher(
+            queue=queue,
+            state=state,
+            run_dir=run_dir,
+            probe=deps.probe,
+            idle_policy=IdlePolicy(expected_indices=range(8)),
+            launcher=launcher,
+            proc_inspector=inspector,
+            state_store=store,
+            event_logger=logger,
+        )
+        if args.resume:
+            dispatcher.reconcile_resume()
+        logger(f"dispatcher started in {run_dir}")
+        return dispatcher.run_forever()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (AlreadyRunningError, ProbeError, ResumeError) as exc:
+        print(f"dispatcher error: {exc}")
+        raise SystemExit(2)
 
 
 class NvidiaSmiProbe:

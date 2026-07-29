@@ -1,17 +1,23 @@
 import json
+import subprocess
 import sys
 from pathlib import Path
 from subprocess import CompletedProcess
+from types import SimpleNamespace
 
 import pytest
 
 from combined_gpu_queue import (
+    AlreadyRunningError,
     Dispatcher,
+    DispatcherLock,
     LaunchRecord,
     NvidiaSmiProbe,
     OwnedProcessLauncher,
     ProcessIdentity,
     ProcessIdentityError,
+    build_parser,
+    main,
 )
 from gpu_queue_core import (
     GpuSnapshot,
@@ -496,3 +502,60 @@ def test_resume_marks_missing_worker_interrupted_and_pauses(tmp_path):
 
     assert next(task for task in state["tasks"] if task["task_id"] == "A01")["status"] == "interrupted"
     assert state["paused_reason"]["kind"] == "process_identity_unverified"
+
+
+def test_cli_requires_exactly_one_mode():
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--dry-run", "--run"])
+
+
+def test_second_dispatcher_lock_is_rejected(tmp_path):
+    first = DispatcherLock(tmp_path / "dispatcher.lock")
+    second = DispatcherLock(tmp_path / "dispatcher.lock")
+    first.acquire()
+    try:
+        with pytest.raises(AlreadyRunningError):
+            second.acquire()
+    finally:
+        first.release()
+
+
+def test_dry_run_reports_all_occupied_gpus_without_creating_state(tmp_path):
+    occupied = tuple(
+        GpuSnapshot(index, f"GPU-{index}", 16000, 0, (9000 + index,))
+        for index in range(8)
+    )
+    output = []
+    dependencies = SimpleNamespace(
+        project_root=Path(__file__).resolve().parents[1],
+        command_file=Path(__file__).resolve().parents[1] / "命令.sh",
+        python_executable=Path(sys.executable),
+        runtime_root=tmp_path / "gpu_queue_runs",
+        probe=StaticProbe(occupied),
+        output=output.append,
+    )
+
+    assert main(["--dry-run"], dependencies=dependencies) == 0
+
+    assert not dependencies.runtime_root.exists()
+    assert len([line for line in output if "compute_pids=" in line]) == 8
+    assert all("unavailable" in line for line in output if "compute_pids=" in line)
+
+
+def test_shell_wrapper_rejects_unknown_mode():
+    project_root = Path(__file__).resolve().parents[1]
+
+    completed = subprocess.run(
+        ["bash", "run_combined_gpu_queue.sh", "unknown"],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "Usage:" in completed.stderr

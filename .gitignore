@@ -287,6 +287,7 @@ __pycache__/
 # --- 实验日志与缓存 ---
 runs/
 logs/
+gpu_queue_runs/
 *.log
 run*_retizero.log
 
