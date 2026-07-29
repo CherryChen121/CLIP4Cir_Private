@@ -84,6 +84,55 @@ def test_eyeclip_and_retizero_appear_once_in_every_combined_phase():
     assert "--retizero-base-path " in phase_b_retizero
 
 
+def test_combined_preflight_uses_runnable_retrieval_checkpoints():
+    combined, _, _ = _command_parts()
+    phase_commands = _phase_commands(combined)
+
+    assert "blip2-flan-t5-xxl" not in combined.lower()
+    assert "clip_RN50x4_noft.pt" not in combined
+
+    for phase in ("A", "B"):
+        noft_command = next(
+            line
+            for line in phase_commands[phase]
+            if "rn50x4_noft" in line.lower()
+        )
+        assert "--clip-model-name RN50x4" in noft_command
+        assert "--clip-model-path" not in noft_command
+
+        blip_large_command = next(
+            line
+            for line in phase_commands[phase]
+            if "run1_combined_blip_" in line
+        )
+        assert (
+            "--clip-model-path "
+            "/data0/qrchen/projects/CLIP4Cir/pretrained_models/"
+            "blip_itm_large_coco/pytorch_model.bin"
+        ) in blip_large_command
+
+    for phase in ("A", "B", "C"):
+        base_commands = [
+            line
+            for line in phase_commands[phase]
+            if "blip_itm_base_coco" in line.lower()
+        ]
+        assert len(base_commands) == 1
+        assert "--clip-model-name BLIP" in base_commands[0]
+        assert "--blip-projection-dim 256" in base_commands[0]
+        assert "--blip-input-resolution 384" in base_commands[0]
+
+    phase_c_base = next(
+        line
+        for line in phase_commands["C"]
+        if "blip_itm_base_coco" in line.lower()
+    )
+    assert (
+        "pretrained_models/Combined/tuned_blip_itm_base_coco_best.pt"
+        in phase_c_base
+    )
+
+
 def test_combined_training_commands_are_isolated_single_gpu_nohup_jobs():
     _, _, commands = _command_parts()
 
