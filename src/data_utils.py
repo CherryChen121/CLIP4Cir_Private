@@ -72,8 +72,14 @@ def _candidate_fashioniq_roots(category: str = None) -> List[Path]:
     return deduped
 
 
-def resolve_fashioniq_root(category: str = None, required_split: str = None) -> Path:
-    for root in _candidate_fashioniq_roots(category):
+def resolve_fashioniq_root(
+        category: str = None, required_split: str = None, dataset_root=None) -> Path:
+    if dataset_root is not None:
+        candidate_roots = [Path(dataset_root).expanduser().resolve()]
+    else:
+        candidate_roots = _candidate_fashioniq_roots(category)
+
+    for root in candidate_roots:
         if not _has_fashioniq_layout(root):
             continue
         if category and required_split:
@@ -83,7 +89,7 @@ def resolve_fashioniq_root(category: str = None, required_split: str = None) -> 
                 continue
         return root
 
-    searched = ", ".join(str(path) for path in _candidate_fashioniq_roots(category))
+    searched = ", ".join(str(path) for path in candidate_roots)
     hint = (
         "Set CLIP4CIR_FASHIONIQ_ROOT, CLIP4CIR_UWF_ROOT, CLIP4CIR_IDRID_ROOT, "
         "or CLIP4CIR_DATA_ROOT to point at your dataset directory."
@@ -91,17 +97,20 @@ def resolve_fashioniq_root(category: str = None, required_split: str = None) -> 
     raise FileNotFoundError(f"Could not resolve FashionIQ-format dataset root for {category}. Searched: {searched}. {hint}")
 
 
-def list_fashioniq_categories(split: str = "train") -> List[str]:
+def list_fashioniq_categories(split: str = "train", dataset_root=None) -> List[str]:
     categories = set()
-    roots = [
-        _env_path("CLIP4CIR_FASHIONIQ_ROOT"),
-        _env_path("CLIP4CIR_UWF_ROOT"),
-        _env_path("CLIP4CIR_IDRID_ROOT"),
-        _data_root() / "UWF_CIR_Dataset_cold",
-        _data_root() / "IDRiD_CIR_Dataset_cold",
-        _data_root() / "fashionIQ_dataset",
-        base_path / "fashionIQ_dataset",
-    ]
+    if dataset_root is not None:
+        roots = [Path(dataset_root).expanduser().resolve()]
+    else:
+        roots = [
+            _env_path("CLIP4CIR_FASHIONIQ_ROOT"),
+            _env_path("CLIP4CIR_UWF_ROOT"),
+            _env_path("CLIP4CIR_IDRID_ROOT"),
+            _data_root() / "UWF_CIR_Dataset_cold",
+            _data_root() / "IDRiD_CIR_Dataset_cold",
+            _data_root() / "fashionIQ_dataset",
+            base_path / "fashionIQ_dataset",
+        ]
     for root in roots:
         if root is None or not _has_fashioniq_layout(root):
             continue
@@ -230,10 +239,14 @@ class FashionIQDataset(Dataset):
             - (reference_image, target_image, image_captions) when split == train
             - (reference_name, target_name, image_captions) when split == val
             - (reference_name, reference_image, image_captions) when split == test
+            - (reference_name, target_name, image_captions) when split == test
+              and return_target is enabled
     The dataset manage an arbitrary numbers of FashionIQ category, e.g. only dress, dress+toptee+shirt, dress+shirt...
     """
 
-    def __init__(self, split: str, dress_types: List[str], mode: str, preprocess: callable):
+    def __init__(
+            self, split: str, dress_types: List[str], mode: str, preprocess: callable,
+            dataset_root=None, return_target: bool = False):
         """
         :param split: dataset split, should be in ['test', 'train', 'val']
         :param dress_types: list of fashionIQ category
@@ -248,15 +261,18 @@ class FashionIQDataset(Dataset):
         self.mode = mode
         self.dress_types = dress_types
         self.split = split
+        self.return_target = return_target
 
         if mode not in ['relative', 'classic']:
             raise ValueError("mode should be in ['relative', 'classic']")
         if split not in ['test', 'train', 'val']:
             raise ValueError("split should be in ['test', 'train', 'val']")
+        if return_target and (split != 'test' or mode != 'relative'):
+            raise ValueError("return_target is only supported for relative test datasets")
 
         self.preprocess = preprocess
         self.dataset_roots = {
-            dress_type: resolve_fashioniq_root(dress_type, split)
+            dress_type: resolve_fashioniq_root(dress_type, split, dataset_root)
             for dress_type in dress_types
         }
         print(
@@ -266,9 +282,12 @@ class FashionIQDataset(Dataset):
 
         # get triplets made by (reference_image, target_image, a pair of relative captions)
         self.triplets: List[dict] = []
+        self.triplet_categories: List[str] = []
         for dress_type in dress_types:
             with open(self.dataset_roots[dress_type] / 'captions' / f'cap.{dress_type}.{split}.json') as f:
-                self.triplets.extend(json.load(f))
+                category_triplets = json.load(f)
+                self.triplets.extend(category_triplets)
+                self.triplet_categories.extend([dress_type] * len(category_triplets))
 
         # get the image names
         self.image_names: list = []
@@ -294,11 +313,30 @@ class FashionIQDataset(Dataset):
         
         # 2. 过滤 triplets
         original_triplets_count = len(self.triplets)
-        self.triplets = [
-            t for t in self.triplets 
-            if get_path(t['candidate']) is not None 
-            and (split == 'test' or get_path(t['target']) is not None)
-        ]
+        filtered_triplets = []
+        filtered_categories = []
+        gallery_names = set(self.image_names)
+        for triplet, dress_type in zip(self.triplets, self.triplet_categories):
+            if get_path(triplet['candidate']) is None:
+                continue
+
+            if split == 'test' and return_target:
+                if not triplet.get('target'):
+                    raise ValueError(
+                        f"FashionIQ category {dress_type} test triplet is missing target")
+                if (triplet['target'] not in gallery_names
+                        or get_path(triplet['target']) is None):
+                    raise ValueError(
+                        f"FashionIQ category {dress_type} test target "
+                        f"{triplet['target']} is missing from the physical gallery")
+            elif split != 'test' and get_path(triplet['target']) is None:
+                continue
+
+            filtered_triplets.append(triplet)
+            filtered_categories.append(dress_type)
+
+        self.triplets = filtered_triplets
+        self.triplet_categories = filtered_categories
 
         print(f"数据校验完成: 索引图片剩余 {len(self.image_names)}/{original_names_count}, 三元组剩余 {len(self.triplets)}/{original_triplets_count}")
         # --- 过滤逻辑结束 ---
@@ -340,6 +378,9 @@ class FashionIQDataset(Dataset):
                 
                 # ... 剩下的 test 和 classic 部分同理，确保返回的是单条 caption ...
                 elif self.split == 'test':
+                    if self.return_target:
+                        target_name = self.triplets[index]['target']
+                        return reference_name, target_name, image_captions
                     # 修改这里
                     reference_image = self.preprocess(PIL.Image.open(_get_existing_path(reference_name)))
                     return reference_name, reference_image, image_captions
