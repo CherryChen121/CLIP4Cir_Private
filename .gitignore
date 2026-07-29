@@ -296,3 +296,6 @@ run*_retizero.log
 .DS_Store
 .anaconda/
 .conda/
+
+# --- Local Git worktrees ---
+.worktrees/
