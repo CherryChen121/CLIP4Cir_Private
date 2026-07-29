@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 import signal
 import subprocess
 import tempfile
@@ -12,9 +13,29 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 try:
-    from gpu_queue_core import GpuSnapshot, ProbeError, TaskSpec
+    from gpu_queue_core import (
+        GpuSnapshot,
+        ProbeError,
+        QueueSpec,
+        TaskSpec,
+        mark_running,
+        next_pending_task,
+        record_conflict,
+        record_exit,
+        record_interrupted,
+    )
 except ImportError:
-    from src.gpu_queue_core import GpuSnapshot, ProbeError, TaskSpec
+    from src.gpu_queue_core import (
+        GpuSnapshot,
+        ProbeError,
+        QueueSpec,
+        TaskSpec,
+        mark_running,
+        next_pending_task,
+        record_conflict,
+        record_exit,
+        record_interrupted,
+    )
 
 
 class ProcessIdentityError(RuntimeError):
@@ -207,6 +228,176 @@ class OwnedProcessLauncher:
             return False
         self.killpg(identity.pgid, signal.SIGKILL)
         return True
+
+
+def _default_owner_lookup(pid: int) -> str:
+    try:
+        return pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_name
+    except (KeyError, OSError):
+        return "unknown"
+
+
+class Dispatcher:
+    def __init__(
+        self,
+        queue: QueueSpec,
+        state: dict,
+        run_dir: Path,
+        probe,
+        idle_policy,
+        launcher: OwnedProcessLauncher,
+        proc_inspector,
+        state_store,
+        sleeper=time.sleep,
+        now=lambda: time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        owner_lookup=_default_owner_lookup,
+        event_logger=lambda message: None,
+    ):
+        self.queue = queue
+        self.state = state
+        self.run_dir = Path(run_dir)
+        self.probe = probe
+        self.idle_policy = idle_policy
+        self.launcher = launcher
+        self.proc_inspector = proc_inspector
+        self.state_store = state_store
+        self.sleeper = sleeper
+        self.now = now
+        self.owner_lookup = owner_lookup
+        self.event_logger = event_logger
+        self._task_specs = {task.task_id: task for task in queue.tasks}
+
+    def _running_tasks(self):
+        return [task for task in self.state["tasks"] if task["status"] == "running"]
+
+    @staticmethod
+    def _identity(task: dict) -> ProcessIdentity:
+        return ProcessIdentity(
+            pid=int(task["pid"]),
+            pgid=int(task["pgid"]),
+            start_ticks=int(task["start_ticks"]),
+            command_sha256=str(task["process_command_sha256"]),
+        )
+
+    def _save(self):
+        self.state_store.save(self.state)
+
+    def _pause_probe_error(self, exc: Exception):
+        if not self.state.get("paused_reason"):
+            self.state["paused_reason"] = {
+                "kind": "gpu_probe_error",
+                "detail": str(exc),
+                "detected_at": self.now(),
+            }
+            self._save()
+
+    def _poll_results(self):
+        for task in list(self._running_tasks()):
+            identity = self._identity(task)
+            try:
+                return_code = self.launcher.poll(identity, Path(task["result_path"]))
+            except ProcessIdentityError:
+                record_interrupted(self.state, task["task_id"], self.now())
+                self._save()
+                continue
+            if return_code is not None:
+                record_exit(self.state, task["task_id"], return_code, self.now())
+                self._save()
+
+    def _monitor_conflicts(self, snapshots: Tuple[GpuSnapshot, ...]):
+        by_index = {gpu.index: gpu for gpu in snapshots}
+        for task in list(self._running_tasks()):
+            gpu = by_index.get(task["gpu_index"])
+            if gpu is None or gpu.uuid != task["gpu_uuid"]:
+                record_interrupted(self.state, task["task_id"], self.now())
+                self._save()
+                continue
+            identity = self._identity(task)
+            owned_pids = self.proc_inspector.descendants(identity.pid) | {identity.pid}
+            unknown = sorted(set(gpu.compute_pids) - owned_pids)
+            if not unknown:
+                continue
+            owners = {pid: self.owner_lookup(pid) for pid in unknown}
+            record_conflict(self.state, task["task_id"], unknown, self.now(), owners)
+            self._save()
+            self.launcher.terminate(identity, grace_seconds=30)
+
+    @staticmethod
+    def _gpu(snapshots: Tuple[GpuSnapshot, ...], index: int) -> Optional[GpuSnapshot]:
+        return next((gpu for gpu in snapshots if gpu.index == index), None)
+
+    def _final_idle_check(self, index: int, expected_uuid: str) -> Optional[GpuSnapshot]:
+        first = self._gpu(self.probe.snapshot(), index)
+        if first is None or first.uuid != expected_uuid or not self.idle_policy.is_idle_now(first):
+            return None
+        self.sleeper(3)
+        second = self._gpu(self.probe.snapshot(), index)
+        if second is None or second.uuid != expected_uuid or not self.idle_policy.is_idle_now(second):
+            return None
+        return second
+
+    def run_cycle(self, sample_idle: bool) -> None:
+        self._poll_results()
+        try:
+            snapshots = self.probe.snapshot()
+        except ProbeError as exc:
+            self._pause_probe_error(exc)
+            return
+        self._monitor_conflicts(snapshots)
+        if self.state.get("paused_reason") or not sample_idle:
+            return
+        try:
+            candidates = self.idle_policy.observe(snapshots)
+        except ProbeError as exc:
+            self._pause_probe_error(exc)
+            return
+        assigned = {task["gpu_index"] for task in self._running_tasks()}
+        for index in candidates:
+            if index in assigned:
+                continue
+            pending = next_pending_task(self.state)
+            if pending is None:
+                break
+            initial_gpu = self._gpu(snapshots, index)
+            if initial_gpu is None:
+                continue
+            try:
+                final_gpu = self._final_idle_check(index, initial_gpu.uuid)
+            except ProbeError as exc:
+                self._pause_probe_error(exc)
+                return
+            if final_gpu is None:
+                continue
+            spec = self._task_specs[pending["task_id"]]
+            launch = self.launcher.start(
+                spec,
+                final_gpu,
+                self.run_dir / "tasks" / spec.task_id,
+            )
+            mark_running(
+                self.state,
+                spec.task_id,
+                launch.state_fields(),
+                final_gpu,
+                self.now(),
+            )
+            self._save()
+            assigned.add(index)
+
+    def reconcile_resume(self) -> None:
+        self._poll_results()
+
+    def run_forever(self) -> int:
+        cycle = 0
+        while True:
+            self.run_cycle(sample_idle=(cycle % 2 == 0))
+            running = self._running_tasks()
+            if self.state.get("paused_reason") and not running:
+                return 2
+            if all(task["status"] == "succeeded" for task in self.state["tasks"]):
+                return 0
+            cycle += 1
+            self.sleeper(30)
 
 
 class NvidiaSmiProbe:

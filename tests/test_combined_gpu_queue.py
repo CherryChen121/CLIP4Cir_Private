@@ -6,11 +6,22 @@ from subprocess import CompletedProcess
 import pytest
 
 from combined_gpu_queue import (
+    Dispatcher,
+    LaunchRecord,
     NvidiaSmiProbe,
     OwnedProcessLauncher,
     ProcessIdentity,
+    ProcessIdentityError,
 )
-from gpu_queue_core import GpuSnapshot, ProbeError, TaskSpec
+from gpu_queue_core import (
+    GpuSnapshot,
+    IdlePolicy,
+    ProbeError,
+    QueueSpec,
+    TaskSpec,
+    initial_state,
+    mark_running,
+)
 from gpu_queue_worker import WorkerError, run_manifest
 
 
@@ -192,3 +203,296 @@ def test_terminate_refuses_signal_when_process_identity_changed(tmp_path):
 
     assert launcher.terminate(original, grace_seconds=0) is False
     assert signals == []
+
+
+def _queue():
+    tasks = []
+    for phase in ("A", "B"):
+        for ordinal in (1, 2):
+            tasks.append(
+                TaskSpec(
+                    task_id=f"{phase}{ordinal:02d}",
+                    phase=phase,
+                    ordinal=ordinal,
+                    argv=(sys.executable, "-c", "raise SystemExit(0)"),
+                    env={"CUDA_VISIBLE_DEVICES": "0", "NCCL_P2P_DISABLE": "1"},
+                    log_name=f"{phase.lower()}{ordinal}.log",
+                    source=f"{phase}{ordinal}",
+                )
+            )
+    return QueueSpec(tuple(tasks), "digest")
+
+
+def _eight_snapshots(overrides=None):
+    overrides = overrides or {}
+    return tuple(
+        overrides.get(index, GpuSnapshot(index, f"GPU-{index}", 0, 0, ()))
+        for index in range(8)
+    )
+
+
+class StaticProbe:
+    def __init__(self, snapshots):
+        self.snapshots = snapshots
+        self.calls = 0
+
+    def snapshot(self):
+        self.calls += 1
+        return self.snapshots
+
+
+class EligiblePolicy:
+    def __init__(self, eligible):
+        self.eligible = tuple(eligible)
+
+    def observe(self, snapshots):
+        return self.eligible
+
+    def is_idle_now(self, snapshot):
+        return not snapshot.compute_pids and snapshot.memory_used_mib <= 512 and snapshot.utilization_percent <= 5
+
+
+class MemoryStore:
+    def __init__(self):
+        self.saved = []
+
+    def save(self, state):
+        self.saved.append(json.loads(json.dumps(state)))
+
+
+class DispatcherLauncher:
+    def __init__(self, exit_codes=None):
+        self.assignments = []
+        self.terminated = []
+        self.exit_codes = exit_codes or {}
+
+    def start(self, task, gpu, task_dir):
+        self.assignments.append((task.task_id, gpu.index))
+        pid = 1000 + len(self.assignments)
+        return LaunchRecord(
+            ProcessIdentity(pid, pid, pid * 10, f"digest-{pid}"),
+            task_dir / "manifest.json",
+            task_dir / "result.json",
+            task_dir / task.log_name,
+        )
+
+    def poll(self, identity, result_path):
+        return self.exit_codes.get(identity.pid)
+
+    def terminate(self, identity, grace_seconds=30):
+        self.terminated.append(identity)
+        return True
+
+
+class Descendants:
+    def __init__(self, values=None):
+        self.values = values or {}
+
+    def descendants(self, pid):
+        return set(self.values.get(pid, set()))
+
+    def identity(self, pid):
+        return None
+
+
+def test_multiple_idle_gpus_receive_tasks_in_gpu_and_queue_order(tmp_path):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    launcher = DispatcherLauncher()
+    sleeps = []
+    dispatcher = Dispatcher(
+        queue=queue,
+        state=state,
+        run_dir=tmp_path,
+        probe=StaticProbe(_eight_snapshots()),
+        idle_policy=EligiblePolicy([2, 5]),
+        launcher=launcher,
+        proc_inspector=Descendants(),
+        state_store=MemoryStore(),
+        sleeper=sleeps.append,
+        now=lambda: "now",
+    )
+
+    dispatcher.run_cycle(sample_idle=True)
+
+    assert launcher.assignments == [("A01", 2), ("A02", 5)]
+    assert sleeps == [3, 3]
+
+
+def test_second_final_probe_becoming_busy_cancels_launch(tmp_path):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    idle = _eight_snapshots()
+    busy = _eight_snapshots({2: GpuSnapshot(2, "GPU-2", 100, 0, (7777,))})
+
+    class SequencedProbe:
+        def __init__(self):
+            self.responses = iter((idle, idle, busy))
+
+        def snapshot(self):
+            return next(self.responses)
+
+    launcher = DispatcherLauncher()
+    dispatcher = Dispatcher(
+        queue=queue,
+        state=state,
+        run_dir=tmp_path,
+        probe=SequencedProbe(),
+        idle_policy=EligiblePolicy([2]),
+        launcher=launcher,
+        proc_inspector=Descendants(),
+        state_store=MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "now",
+    )
+
+    dispatcher.run_cycle(sample_idle=True)
+
+    assert launcher.assignments == []
+
+
+def test_unknown_compute_pid_pauses_and_stops_only_owned_task(tmp_path):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    gpu = GpuSnapshot(3, "GPU-3", 2000, 80, (101, 202, 7777))
+    launch = {
+        "pid": 101,
+        "pgid": 101,
+        "start_ticks": 10,
+        "command_sha256": "owned",
+        "manifest_path": str(tmp_path / "manifest.json"),
+        "result_path": str(tmp_path / "result.json"),
+        "log_path": str(tmp_path / "task.log"),
+    }
+    mark_running(state, "A01", launch, gpu, "start")
+    launcher = DispatcherLauncher()
+    dispatcher = Dispatcher(
+        queue=queue,
+        state=state,
+        run_dir=tmp_path,
+        probe=StaticProbe(_eight_snapshots({3: gpu})),
+        idle_policy=EligiblePolicy([]),
+        launcher=launcher,
+        proc_inspector=Descendants({101: {202}}),
+        state_store=MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "detected",
+        owner_lookup=lambda pid: "other-user",
+    )
+
+    dispatcher.run_cycle(sample_idle=False)
+
+    assert [identity.pid for identity in launcher.terminated] == [101]
+    assert state["paused_reason"]["kind"] == "foreign_gpu_process"
+    assert state["paused_reason"]["unknown_pids"] == [7777]
+    assert next(task for task in state["tasks"] if task["task_id"] == "A01")["status"] == "conflict_stopped"
+
+
+def test_failed_task_pauses_but_other_owned_job_keeps_running(tmp_path):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    for task_id, pid, gpu_index in (("A01", 101, 0), ("A02", 102, 1)):
+        mark_running(
+            state,
+            task_id,
+            {
+                "pid": pid,
+                "pgid": pid,
+                "start_ticks": pid,
+                "command_sha256": f"digest-{pid}",
+                "manifest_path": str(tmp_path / task_id / "manifest.json"),
+                "result_path": str(tmp_path / task_id / "result.json"),
+                "log_path": str(tmp_path / task_id / "task.log"),
+            },
+            GpuSnapshot(gpu_index, f"GPU-{gpu_index}", 100, 10, (pid,)),
+            "start",
+        )
+    launcher = DispatcherLauncher(exit_codes={101: 1, 102: None})
+    snapshots = _eight_snapshots(
+        {
+            0: GpuSnapshot(0, "GPU-0", 0, 0, ()),
+            1: GpuSnapshot(1, "GPU-1", 100, 10, (102,)),
+        }
+    )
+    dispatcher = Dispatcher(
+        queue=queue,
+        state=state,
+        run_dir=tmp_path,
+        probe=StaticProbe(snapshots),
+        idle_policy=EligiblePolicy([]),
+        launcher=launcher,
+        proc_inspector=Descendants(),
+        state_store=MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "end",
+    )
+
+    dispatcher.run_cycle(sample_idle=False)
+
+    assert state["paused_reason"]["kind"] == "task_failed"
+    assert next(task for task in state["tasks"] if task["task_id"] == "A02")["status"] == "running"
+    assert launcher.terminated == []
+
+
+def test_resume_keeps_exact_live_worker_running(tmp_path):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    mark_running(
+        state,
+        "A01",
+        {
+            "pid": 101,
+            "pgid": 101,
+            "start_ticks": 10,
+            "command_sha256": "owned",
+            "manifest_path": str(tmp_path / "manifest.json"),
+            "result_path": str(tmp_path / "result.json"),
+            "log_path": str(tmp_path / "task.log"),
+        },
+        GpuSnapshot(0, "GPU-0", 100, 10, (101,)),
+        "start",
+    )
+    dispatcher = Dispatcher(
+        queue, state, tmp_path, StaticProbe(_eight_snapshots()),
+        EligiblePolicy([]), DispatcherLauncher(), Descendants(), MemoryStore(),
+        sleeper=lambda seconds: None, now=lambda: "resume",
+    )
+
+    dispatcher.reconcile_resume()
+
+    assert next(task for task in state["tasks"] if task["task_id"] == "A01")["status"] == "running"
+    assert state["paused_reason"] is None
+
+
+def test_resume_marks_missing_worker_interrupted_and_pauses(tmp_path):
+    class MissingLauncher(DispatcherLauncher):
+        def poll(self, identity, result_path):
+            raise ProcessIdentityError("missing")
+
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    mark_running(
+        state,
+        "A01",
+        {
+            "pid": 101,
+            "pgid": 101,
+            "start_ticks": 10,
+            "command_sha256": "owned",
+            "manifest_path": str(tmp_path / "manifest.json"),
+            "result_path": str(tmp_path / "result.json"),
+            "log_path": str(tmp_path / "task.log"),
+        },
+        GpuSnapshot(0, "GPU-0", 100, 10, (101,)),
+        "start",
+    )
+    dispatcher = Dispatcher(
+        queue, state, tmp_path, StaticProbe(_eight_snapshots()),
+        EligiblePolicy([]), MissingLauncher(), Descendants(), MemoryStore(),
+        sleeper=lambda seconds: None, now=lambda: "resume",
+    )
+
+    dispatcher.reconcile_resume()
+
+    assert next(task for task in state["tasks"] if task["task_id"] == "A01")["status"] == "interrupted"
+    assert state["paused_reason"]["kind"] == "process_identity_unverified"
