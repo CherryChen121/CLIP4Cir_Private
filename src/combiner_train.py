@@ -358,6 +358,7 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
         disable_targetpad_in_medical=disable_targetpad_in_medical,
         medical_mode=medical_mode,
     )
+    fashioniq_root = kwargs.get("fashioniq_root")
     print(
         "🧪 Preprocess split: "
         f"train_aug={'ON' if train_preprocess is not eval_preprocess else 'OFF'}, "
@@ -433,9 +434,11 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
 
     for idx, dress_type in enumerate(val_dress_types):
         idx_to_dress_mapping[idx] = dress_type
-        relative_val_dataset = FashionIQDataset('val', [dress_type], 'relative', eval_preprocess)
+        relative_val_dataset = FashionIQDataset(
+            'val', [dress_type], 'relative', eval_preprocess, dataset_root=fashioniq_root)
         relative_val_datasets.append(relative_val_dataset)
-        classic_val_dataset = FashionIQDataset('val', [dress_type], 'classic', eval_preprocess)
+        classic_val_dataset = FashionIQDataset(
+            'val', [dress_type], 'classic', eval_preprocess, dataset_root=fashioniq_root)
         index_features_and_names = extract_index_features(classic_val_dataset, clip_model)
         index_features_list.append(index_features_and_names[0])
         index_names_list.append(index_features_and_names[1])
@@ -467,7 +470,8 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
     
     combiner = combiner.to(device)
 
-    relative_train_dataset = FashionIQDataset('train', train_dress_types, 'relative', train_preprocess)
+    relative_train_dataset = FashionIQDataset(
+        'train', train_dress_types, 'relative', train_preprocess, dataset_root=fashioniq_root)
     relative_train_loader = DataLoader(dataset=relative_train_dataset, batch_size=batch_size,
                                        num_workers=_dataloader_num_workers(), pin_memory=True, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
@@ -1063,6 +1067,12 @@ if __name__ == '__main__':
                         help="Save only the best model during training")
 
     parser.add_argument("--dress-types", nargs='+', default=['shirt', 'dress', 'toptee'], help="fashionIQ categories")
+    parser.add_argument(
+        "--fashioniq-root",
+        type=str,
+        default=None,
+        help="Explicit root for a FashionIQ-style dataset; overrides root auto-discovery",
+    )
     parser.add_argument("--retizero-base-path", type=str, default=None,
                         help="Path to base RetiZero.pth (used when --clip-model-path is a LoRA checkpoint)")
     parser.add_argument("--retfound-backbone-path", type=str, default=None,
@@ -1092,6 +1102,7 @@ if __name__ == '__main__':
         "num_epochs": args.num_epochs,
         "clip_model_name": args.clip_model_name,
         "clip_model_path": args.clip_model_path,
+        "fashioniq_root": args.fashioniq_root,
         "combiner_lr": args.combiner_lr,
         "weight_decay": args.weight_decay,
         "max_grad_norm": args.max_grad_norm,

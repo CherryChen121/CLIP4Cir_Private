@@ -390,6 +390,7 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
         medical_mode=medical_mode,
         disable_targetpad_in_medical=disable_targetpad_in_medical,
     )
+    fashioniq_root = kwargs.get("fashioniq_root")
     print(
         "🧪 Fine-tune preprocess: "
         f"transform={transform}, force_rgb={'ON' if force_rgb else 'OFF'}, "
@@ -410,9 +411,11 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
     # Define the validation datasets
     for idx, dress_type in enumerate(val_dress_types):
         idx_to_dress_mapping[idx] = dress_type
-        relative_val_dataset = FashionIQDataset('val', [dress_type], 'relative', preprocess, )
+        relative_val_dataset = FashionIQDataset(
+            'val', [dress_type], 'relative', preprocess, dataset_root=fashioniq_root)
         relative_val_datasets.append(relative_val_dataset)
-        classic_val_dataset = FashionIQDataset('val', [dress_type], 'classic', preprocess, )
+        classic_val_dataset = FashionIQDataset(
+            'val', [dress_type], 'classic', preprocess, dataset_root=fashioniq_root)
         classic_val_datasets.append(classic_val_dataset)
         if encoder == 'text':
             index_features_and_names = extract_index_features(classic_val_dataset, clip_model)
@@ -420,7 +423,8 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
             index_names_list.append(index_features_and_names[1])
 
     # Define the train datasets and the combining function
-    relative_train_dataset = FashionIQDataset('train', train_dress_types, 'relative', preprocess)
+    relative_train_dataset = FashionIQDataset(
+        'train', train_dress_types, 'relative', preprocess, dataset_root=fashioniq_root)
     relative_train_loader = DataLoader(dataset=relative_train_dataset, batch_size=batch_size,
                                        num_workers=_dataloader_num_workers(), pin_memory=False, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
@@ -826,6 +830,12 @@ if __name__ == '__main__':
     parser.add_argument("--num-epochs", default=300, type=int, help="number training epochs")
     parser.add_argument("--dress-types", nargs='+', default=None,
                         help="FashionIQ-format categories to use, e.g. IDRiD or CH CO NM RB RCH UM")
+    parser.add_argument(
+        "--fashioniq-root",
+        type=str,
+        default=None,
+        help="Explicit root for a FashionIQ-style dataset; overrides root auto-discovery",
+    )
     parser.add_argument("--clip-model-name", default="RN50x4", type=str,
                         help="CLIP model to use, e.g. 'RN50x4', 'ViT-B/32', 'ViT-L/14' (default remains RN50x4)")
     parser.add_argument("--encoder", default='both', type=str,
@@ -881,6 +891,7 @@ if __name__ == '__main__':
     training_hyper_params = {
         "num_epochs": args.num_epochs,
         "dress_types": args.dress_types,
+        "fashioniq_root": args.fashioniq_root,
         "clip_model_name": args.clip_model_name,
         "learning_rate": args.learning_rate,
         "scheduler_patience": args.scheduler_patience,
@@ -929,7 +940,8 @@ if __name__ == '__main__':
         training_hyper_params.pop("dress_types", None)
         clip_finetune_cirr(**training_hyper_params)
     elif args.dataset.lower() == 'fashioniq':
-        valid_dress_types = args.dress_types or list_fashioniq_categories("train")
+        valid_dress_types = args.dress_types or list_fashioniq_categories(
+            "train", args.fashioniq_root)
         if not valid_dress_types:
             valid_dress_types = ['CH', 'CO', 'NM', 'RB', 'RCH', 'UM', 'IDRiD']
 
