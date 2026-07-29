@@ -63,6 +63,52 @@ class GpuSnapshot:
     compute_pids: Tuple[int, ...] = ()
 
 
+class IdlePolicy:
+    def __init__(
+        self,
+        expected_indices: Iterable[int],
+        memory_limit_mib: int = 512,
+        utilization_limit_percent: int = 5,
+        required_samples: int = 5,
+    ):
+        self.expected_indices = tuple(expected_indices)
+        self.memory_limit_mib = memory_limit_mib
+        self.utilization_limit_percent = utilization_limit_percent
+        self.required_samples = required_samples
+        self._uuid_by_index: Optional[Dict[int, str]] = None
+        self._counts: Dict[str, int] = {}
+
+    def is_idle_now(self, snapshot: GpuSnapshot) -> bool:
+        return (
+            not snapshot.compute_pids
+            and snapshot.memory_used_mib <= self.memory_limit_mib
+            and snapshot.utilization_percent <= self.utilization_limit_percent
+        )
+
+    def observe(self, snapshots: Sequence[GpuSnapshot]) -> Tuple[int, ...]:
+        by_index = {snapshot.index: snapshot for snapshot in snapshots}
+        if tuple(sorted(by_index)) != tuple(sorted(self.expected_indices)):
+            raise ProbeError(
+                f"expected GPU indices {self.expected_indices}, found {tuple(sorted(by_index))}"
+            )
+        mapping = {index: by_index[index].uuid for index in self.expected_indices}
+        if self._uuid_by_index is None:
+            self._uuid_by_index = mapping
+        elif mapping != self._uuid_by_index:
+            raise ProbeError("GPU UUID mapping changed")
+
+        eligible = []
+        for index in self.expected_indices:
+            snapshot = by_index[index]
+            if self.is_idle_now(snapshot):
+                self._counts[snapshot.uuid] = self._counts.get(snapshot.uuid, 0) + 1
+            else:
+                self._counts[snapshot.uuid] = 0
+            if self._counts[snapshot.uuid] >= self.required_samples:
+                eligible.append(index)
+        return tuple(sorted(eligible))
+
+
 def _phase_lines(combined: str, phase: str, next_phase: str) -> list[str]:
     marker = f"# Phase {phase}:"
     next_marker = f"# Phase {next_phase}:"

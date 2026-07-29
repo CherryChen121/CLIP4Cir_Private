@@ -1,10 +1,12 @@
-import json
 from pathlib import Path
 
 import pytest
 
 from gpu_queue_core import (
     PreflightError,
+    GpuSnapshot,
+    IdlePolicy,
+    ProbeError,
     QueueSpec,
     TaskSpec,
     parse_combined_queue,
@@ -129,3 +131,61 @@ def test_preflight_rejects_unknown_cli_option():
 
     with pytest.raises(PreflightError, match="--definitely-unknown"):
         preflight_queue(_queue(task), PROJECT_ROOT)
+
+
+def _snapshots(gpu0=(0, 0, ())):
+    memory, utilization, pids = gpu0
+    return tuple(
+        GpuSnapshot(
+            index=index,
+            uuid=f"GPU-{index}",
+            memory_used_mib=memory if index == 0 else 0,
+            utilization_percent=utilization if index == 0 else 0,
+            compute_pids=tuple(pids) if index == 0 else (),
+        )
+        for index in range(8)
+    )
+
+
+@pytest.mark.parametrize(
+    "gpu0",
+    [
+        (513, 0, ()),
+        (0, 6, ()),
+        (0, 0, (42,)),
+    ],
+)
+def test_idle_policy_fails_closed(gpu0):
+    policy = IdlePolicy(expected_indices=range(8))
+
+    assert 0 not in policy.observe(_snapshots(gpu0))
+
+
+def test_gpu_becomes_candidate_only_on_fifth_consecutive_sample():
+    policy = IdlePolicy(expected_indices=range(8))
+
+    for _ in range(4):
+        assert 0 not in policy.observe(_snapshots())
+    assert 0 in policy.observe(_snapshots())
+
+
+def test_busy_sample_resets_consecutive_idle_count():
+    policy = IdlePolicy(expected_indices=range(8))
+    for _ in range(4):
+        policy.observe(_snapshots())
+
+    policy.observe(_snapshots((0, 0, (99,))))
+
+    for _ in range(4):
+        assert 0 not in policy.observe(_snapshots())
+    assert 0 in policy.observe(_snapshots())
+
+
+def test_idle_policy_rejects_gpu_uuid_mapping_change():
+    policy = IdlePolicy(expected_indices=range(8))
+    policy.observe(_snapshots())
+    changed = list(_snapshots())
+    changed[0] = GpuSnapshot(0, "GPU-changed", 0, 0, ())
+
+    with pytest.raises(ProbeError, match="UUID mapping"):
+        policy.observe(tuple(changed))
