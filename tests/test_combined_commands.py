@@ -29,15 +29,59 @@ def _command_parts():
     return combined, legacy, commands
 
 
+def _phase_commands(combined):
+    phase_sections = {}
+    for phase, next_phase in (("A", "B"), ("B", "C"), ("C", None)):
+        start = combined.index(f"# Phase {phase}:")
+        end = combined.index(f"# Phase {next_phase}:") if next_phase else len(combined)
+        phase_sections[phase] = [
+            line
+            for line in combined[start:end].splitlines()
+            if line.startswith("CUDA_VISIBLE_DEVICES=")
+            and " nohup python src/" in line
+        ]
+    return phase_sections
+
+
 def test_combined_training_matrix_has_one_command_per_configuration():
     combined, _, commands = _command_parts()
+    phase_commands = _phase_commands(combined)
 
-    assert len(commands) == 29
-    assert sum("src/combiner_train.py" in line for line in commands) == 19
+    assert len(commands) == 30
+    assert sum("src/combiner_train.py" in line for line in commands) == 20
     assert sum("src/clip_fine_tune.py" in line for line in commands) == 10
+    assert {phase: len(lines) for phase, lines in phase_commands.items()} == {
+        "A": 10,
+        "B": 10,
+        "C": 10,
+    }
     assert combined.count("# Phase A:") == 1
     assert combined.count("# Phase B:") == 1
     assert combined.count("# Phase C:") == 1
+    assert not any("RETFound" in line for line in commands)
+
+
+def test_eyeclip_and_retizero_appear_once_in_every_combined_phase():
+    combined, _, _ = _command_parts()
+    phase_commands = _phase_commands(combined)
+
+    for model_tag in ("eyeclip", "retizero"):
+        assert all(
+            sum(model_tag in line.lower() for line in phase_commands[phase]) == 1
+            for phase in ("A", "B", "C")
+        )
+
+    phase_a_eyeclip = next(
+        line for line in phase_commands["A"] if "eyeclip" in line.lower()
+    )
+    assert "pretrained_models/eyeclip_clip4cir_vitb32.pt" in phase_a_eyeclip
+
+    phase_b_retizero = next(
+        line for line in phase_commands["B"] if "retizero" in line.lower()
+    )
+    assert "src/clip_fine_tune.py" in phase_b_retizero
+    assert "--clip-model-name RetiZero" in phase_b_retizero
+    assert "--retizero-base-path " in phase_b_retizero
 
 
 def test_combined_training_commands_are_isolated_single_gpu_nohup_jobs():
@@ -56,8 +100,8 @@ def test_combined_training_commands_use_unique_log_files():
 
     log_names = [re.search(r">\s+(\S+\.log)\s+2>&1", line).group(1) for line in commands]
 
-    assert len(log_names) == 29
-    assert len(set(log_names)) == 29
+    assert len(log_names) == 30
+    assert len(set(log_names)) == 30
     assert all(name.startswith("run1_combined_") for name in log_names)
 
 
