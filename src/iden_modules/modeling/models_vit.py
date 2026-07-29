@@ -36,6 +36,11 @@ class VisionTransformer(TimmVisionTransformer):
             outcome = x[:, 0]
         return outcome
 
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head_drop(x)
+        return self.head(x)
+
 
 if __name__ == "__main__":
     import timm_models
@@ -44,4 +49,3 @@ if __name__ == "__main__":
     output,local_features = net(images,True)
     print(output.shape)
     print(local_features.shape)
-

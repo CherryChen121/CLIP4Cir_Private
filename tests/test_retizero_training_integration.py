@@ -3,6 +3,7 @@ from functools import partial
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch
 from torch import nn
 
 import clip_fine_tune
@@ -102,6 +103,8 @@ def test_retizero_vit_imports_without_ignored_vendored_models():
         qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
+    model.head = nn.Identity()
 
     assert callable(lora)
     assert len(model.blocks) == 1
+    assert model(torch.zeros(1, 3, 224, 224)).shape == (1, 32)
