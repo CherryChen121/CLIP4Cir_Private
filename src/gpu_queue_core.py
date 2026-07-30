@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -249,8 +250,191 @@ def preflight_queue(queue: QueueSpec, project_root: Path) -> None:
         raise PreflightError("\n".join(errors))
 
 
-SCHEMA_VERSION = 1
-TERMINAL_STATUSES = {"succeeded", "failed", "conflict_stopped", "interrupted"}
+SCHEMA_VERSION = 2
+MAX_GPU_LEASES = 4
+TERMINAL_STATUSES = {"succeeded", "failed", "launch_failed", "interrupted"}
+
+
+def _single_line(value: object) -> str:
+    return " ".join(str(value).split())
+
+
+def lease_for_gpu(state: dict, gpu_index: int) -> Optional[dict]:
+    return next(
+        (
+            lease
+            for lease in state.get("leases", [])
+            if int(lease["gpu_index"]) == int(gpu_index)
+        ),
+        None,
+    )
+
+
+def acquire_lease(
+    state: dict,
+    gpu: GpuSnapshot,
+    task_id: str,
+    acquired_at: str,
+) -> dict:
+    leases = state.setdefault("leases", [])
+    if len(leases) >= MAX_GPU_LEASES:
+        raise ResumeError(f"state may hold at most {MAX_GPU_LEASES} GPU leases")
+    if any(int(lease["gpu_index"]) == gpu.index for lease in leases):
+        raise ResumeError(f"duplicate GPU index in leases: {gpu.index}")
+    if any(lease["gpu_uuid"] == gpu.uuid for lease in leases):
+        raise ResumeError(f"duplicate GPU UUID in leases: {gpu.uuid}")
+    if any(lease.get("task_id") == task_id for lease in leases):
+        raise ResumeError(f"duplicate lease task: {task_id}")
+    lease = {
+        "gpu_index": gpu.index,
+        "gpu_uuid": gpu.uuid,
+        "state": "running",
+        "task_id": task_id,
+        "previous_task_id": None,
+        "cooldown_ready_at": None,
+        "acquired_at": acquired_at,
+        "updated_at": acquired_at,
+    }
+    leases.append(lease)
+    return lease
+
+
+def mark_lease_cooldown(
+    state: dict,
+    task_id: str,
+    cooldown_ready_at: float,
+    updated_at: str,
+) -> dict:
+    matches = [
+        lease
+        for lease in state.get("leases", [])
+        if lease.get("state") == "running" and lease.get("task_id") == task_id
+    ]
+    if len(matches) != 1:
+        raise ResumeError(f"task {task_id} does not have exactly one running lease")
+    ready_at = float(cooldown_ready_at)
+    if not math.isfinite(ready_at):
+        raise ResumeError("cooldown_ready_at must be finite")
+    lease = matches[0]
+    lease.update(
+        {
+            "state": "cooldown",
+            "task_id": None,
+            "previous_task_id": task_id,
+            "cooldown_ready_at": ready_at,
+            "updated_at": updated_at,
+        }
+    )
+    return lease
+
+
+def release_lease(state: dict, gpu_index: int) -> dict:
+    matches = [
+        lease
+        for lease in state.get("leases", [])
+        if int(lease["gpu_index"]) == int(gpu_index)
+    ]
+    if len(matches) != 1:
+        raise ResumeError(f"GPU {gpu_index} does not have exactly one lease")
+    lease = matches[0]
+    state["leases"].remove(lease)
+    return lease
+
+
+def record_launch_failed(
+    state: dict,
+    task_id: str,
+    detail: str,
+    ended_at: str,
+    gpu: GpuSnapshot,
+) -> None:
+    task = _state_task(state, task_id)
+    if task["status"] != "pending":
+        raise ResumeError(f"task {task_id} is not pending")
+    task.update(
+        {
+            "status": "launch_failed",
+            "gpu_index": gpu.index,
+            "gpu_uuid": gpu.uuid,
+            "ended_at": ended_at,
+            "error": _single_line(detail),
+        }
+    )
+
+
+def all_tasks_terminal(state: dict) -> bool:
+    return all(task.get("status") in TERMINAL_STATUSES for task in state["tasks"])
+
+
+def terminal_summary(state: dict) -> dict:
+    task_ids = {
+        status: [
+            task["task_id"]
+            for task in state["tasks"]
+            if task.get("status") == status
+        ]
+        for status in ("succeeded", "failed", "launch_failed", "interrupted")
+    }
+    return {
+        "total": len(state["tasks"]),
+        **{status: len(task_ids[status]) for status in task_ids},
+        "task_ids": task_ids,
+    }
+
+
+def validate_lease_state(state: dict) -> None:
+    leases = state.get("leases")
+    if not isinstance(leases, list):
+        raise ResumeError("state leases must be a list")
+    if len(leases) > MAX_GPU_LEASES:
+        raise ResumeError(f"state may hold at most {MAX_GPU_LEASES} GPU leases")
+
+    indices = [lease.get("gpu_index") for lease in leases]
+    if len(set(indices)) != len(indices):
+        raise ResumeError("duplicate GPU index in leases")
+    uuids = [lease.get("gpu_uuid") for lease in leases]
+    if len(set(uuids)) != len(uuids):
+        raise ResumeError("duplicate GPU UUID in leases")
+    task_ids = [
+        lease.get("task_id")
+        for lease in leases
+        if lease.get("task_id") is not None
+    ]
+    if len(set(task_ids)) != len(task_ids):
+        raise ResumeError("duplicate lease task")
+
+    for lease in leases:
+        lease_state = lease.get("state")
+        if lease_state not in {"running", "cooldown"}:
+            raise ResumeError(f"invalid lease state: {lease_state}")
+        if not isinstance(lease.get("gpu_index"), int):
+            raise ResumeError("lease gpu_index must be an integer")
+        if not isinstance(lease.get("gpu_uuid"), str) or not lease["gpu_uuid"]:
+            raise ResumeError("lease gpu_uuid must be non-empty")
+        ready_at = lease.get("cooldown_ready_at")
+        if lease_state == "running":
+            if lease.get("task_id") is None:
+                raise ResumeError("running lease has no task")
+            if ready_at is not None:
+                raise ResumeError("running lease cooldown_ready_at must be empty")
+        else:
+            if lease.get("task_id") is not None:
+                raise ResumeError("cooldown lease cannot have a task")
+            if not isinstance(ready_at, (int, float)) or not math.isfinite(
+                float(ready_at)
+            ):
+                raise ResumeError("cooldown_ready_at must be finite")
+
+    running_tasks = {
+        task["task_id"]
+        for task in state.get("tasks", [])
+        if task.get("status") == "running"
+    }
+    running_leases = {
+        lease["task_id"] for lease in leases if lease.get("state") == "running"
+    }
+    if running_tasks != running_leases:
+        raise ResumeError("running task and running lease associations do not match")
 
 
 def initial_state(
@@ -264,6 +448,7 @@ def initial_state(
         "created_at": created_at,
         "command_sha256": queue.command_sha256,
         "paused_reason": None,
+        "leases": [],
         "tasks": [
             {
                 "task_id": task.task_id,
@@ -286,6 +471,7 @@ def initial_state(
                 "ended_at": None,
                 "return_code": None,
                 "conflict": None,
+                "error": None,
             }
             for task in queue.tasks
         ],
@@ -304,7 +490,7 @@ def next_pending_task(state: dict) -> Optional[dict]:
         return None
     phase_a = [task for task in state["tasks"] if task["phase"] == "A"]
     phase_b = [task for task in state["tasks"] if task["phase"] == "B"]
-    if not all(task["status"] == "succeeded" for task in phase_a):
+    if not all(task["status"] in TERMINAL_STATUSES for task in phase_a):
         candidates = [task for task in phase_a if task["status"] == "pending"]
     else:
         candidates = [task for task in phase_b if task["status"] == "pending"]
@@ -345,13 +531,6 @@ def record_exit(state: dict, task_id: str, return_code: int, ended_at: str) -> N
     task["return_code"] = int(return_code)
     task["ended_at"] = ended_at
     task["status"] = "succeeded" if return_code == 0 else "failed"
-    if return_code != 0 and not state.get("paused_reason"):
-        state["paused_reason"] = {
-            "kind": "task_failed",
-            "task_id": task_id,
-            "return_code": int(return_code),
-            "detected_at": ended_at,
-        }
 
 
 def record_conflict(
@@ -380,11 +559,7 @@ def record_interrupted(state: dict, task_id: str, detected_at: str) -> None:
     task = _state_task(state, task_id)
     task["status"] = "interrupted"
     task["ended_at"] = detected_at
-    state["paused_reason"] = {
-        "kind": "process_identity_unverified",
-        "task_id": task_id,
-        "detected_at": detected_at,
-    }
+    task["error"] = "process identity could not be verified"
 
 
 def validate_resume_state(state: dict, queue: QueueSpec) -> None:
@@ -416,6 +591,7 @@ def validate_resume_state(state: dict, queue: QueueSpec) -> None:
         )
     if actual != expected:
         raise ResumeError("state task definitions do not match queue")
+    validate_lease_state(state)
 
 
 class AtomicStateStore:

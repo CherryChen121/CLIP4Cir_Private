@@ -7,16 +7,25 @@ from gpu_queue_core import (
     PreflightError,
     GpuSnapshot,
     IdlePolicy,
+    MAX_GPU_LEASES,
     ProbeError,
     QueueSpec,
     ResumeError,
     TaskSpec,
+    acquire_lease,
+    all_tasks_terminal,
     initial_state,
     mark_running,
+    mark_lease_cooldown,
     next_pending_task,
     parse_combined_queue,
     preflight_queue,
     record_exit,
+    record_interrupted,
+    record_launch_failed,
+    release_lease,
+    terminal_summary,
+    validate_lease_state,
     validate_resume_state,
 )
 
@@ -243,21 +252,38 @@ def _task_state(state, task_id):
     return next(task for task in state["tasks"] if task["task_id"] == task_id)
 
 
-def test_phase_b_is_blocked_until_every_phase_a_task_succeeds():
+def test_initial_state_has_empty_lease_pool_and_task_error_fields():
+    state = initial_state(_small_queue(), "run-1", "created")
+
+    assert state["schema_version"] == 2
+    assert state["leases"] == []
+    assert all(task["error"] is None for task in state["tasks"])
+    assert MAX_GPU_LEASES == 4
+
+
+def test_phase_b_opens_after_every_phase_a_task_is_terminal():
     state = initial_state(_small_queue(), "run-1", "2026-07-30T00:00:00")
     gpu = GpuSnapshot(0, "GPU-0", 0, 0, ())
 
     assert next_pending_task(state)["task_id"] == "A01"
     mark_running(state, "A01", _launch(), gpu, "start")
-    record_exit(state, "A01", 0, "end")
+    record_exit(state, "A01", 7, "end")
     assert next_pending_task(state)["task_id"] == "A02"
-    mark_running(state, "A02", _launch(), gpu, "start")
-    record_exit(state, "A02", 0, "end")
+    record_launch_failed(state, "A02", "worker disappeared", "end", gpu)
 
     assert next_pending_task(state)["task_id"] == "B01"
 
 
-def test_nonzero_exit_pauses_new_dispatch_but_keeps_other_task_running():
+def test_phase_b_remains_blocked_while_a_phase_a_task_is_running():
+    state = initial_state(_small_queue(), "run-1", "created")
+    gpu = GpuSnapshot(0, "GPU-0", 0, 0, ())
+    mark_running(state, "A01", _launch(), gpu, "start")
+    record_launch_failed(state, "A02", "launch failed", "end", gpu)
+
+    assert next_pending_task(state) is None
+
+
+def test_nonzero_exit_does_not_pause_new_dispatch_or_stop_other_task():
     state = initial_state(_small_queue(), "run-1", "created")
     gpu0 = GpuSnapshot(0, "GPU-0", 0, 0, ())
     gpu1 = GpuSnapshot(1, "GPU-1", 0, 0, ())
@@ -267,9 +293,121 @@ def test_nonzero_exit_pauses_new_dispatch_but_keeps_other_task_running():
 
     record_exit(state, "A01", 7, "end")
 
-    assert state["paused_reason"]["kind"] == "task_failed"
+    assert state["paused_reason"] is None
     assert _task_state(state, "A02")["status"] == "running"
     assert next_pending_task(state) is None
+
+
+def test_launch_failure_and_interruption_are_terminal_without_pausing():
+    state = initial_state(_small_queue(), "run-1", "created")
+    gpu = GpuSnapshot(2, "GPU-2", 0, 0, ())
+
+    record_launch_failed(state, "A01", "bad\nlaunch", "end-1", gpu)
+    mark_running(state, "A02", _launch(), gpu, "start")
+    record_interrupted(state, "A02", "end-2")
+
+    failed = _task_state(state, "A01")
+    interrupted = _task_state(state, "A02")
+    assert failed["status"] == "launch_failed"
+    assert failed["error"] == "bad launch"
+    assert failed["gpu_index"] == 2
+    assert failed["gpu_uuid"] == "GPU-2"
+    assert interrupted["status"] == "interrupted"
+    assert state["paused_reason"] is None
+
+
+def test_lease_lifecycle_enforces_four_slot_limit():
+    state = initial_state(_small_queue(), "run-1", "created")
+    for index, task_id in enumerate(("A01", "A02", "B01", "B02")):
+        acquire_lease(
+            state,
+            GpuSnapshot(index, f"GPU-{index}", 0, 0, ()),
+            task_id,
+            "acquired",
+        )
+
+    with pytest.raises(ResumeError, match="at most 4"):
+        acquire_lease(
+            state,
+            GpuSnapshot(4, "GPU-4", 0, 0, ()),
+            "extra",
+            "acquired",
+        )
+
+    lease = mark_lease_cooldown(state, "A01", 60.0, "updated")
+    assert lease["state"] == "cooldown"
+    assert lease["previous_task_id"] == "A01"
+    assert lease["task_id"] is None
+    assert lease["cooldown_ready_at"] == 60.0
+    assert release_lease(state, 0)["gpu_uuid"] == "GPU-0"
+    assert len(state["leases"]) == 3
+
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        (
+            lambda leases: leases.append(dict(leases[0], task_id="B01")),
+            "duplicate GPU index",
+        ),
+        (
+            lambda leases: leases.append(
+                dict(leases[0], gpu_index=1, task_id="B01")
+            ),
+            "duplicate GPU UUID",
+        ),
+        (
+            lambda leases: leases.append(
+                dict(leases[0], gpu_index=1, gpu_uuid="GPU-1")
+            ),
+            "duplicate lease task",
+        ),
+        (
+            lambda leases: leases.__setitem__(
+                0, dict(leases[0], cooldown_ready_at=float("inf"))
+            ),
+            "cooldown_ready_at",
+        ),
+    ],
+)
+def test_lease_validation_rejects_duplicate_or_invalid_state(mutate, match):
+    state = initial_state(_small_queue(), "run-1", "created")
+    acquire_lease(state, GpuSnapshot(0, "GPU-0", 0, 0, ()), "A01", "acquired")
+    mutate(state["leases"])
+
+    with pytest.raises(ResumeError, match=match):
+        validate_lease_state(state)
+
+
+def test_resume_requires_running_tasks_and_leases_to_match():
+    state = initial_state(_small_queue(), "run-1", "created")
+    gpu = GpuSnapshot(0, "GPU-0", 0, 0, ())
+    mark_running(state, "A01", _launch(), gpu, "start")
+
+    with pytest.raises(ResumeError, match="running task.*lease"):
+        validate_resume_state(state, _small_queue())
+
+
+def test_terminal_summary_reports_partial_success_task_ids():
+    state = initial_state(_small_queue(), "run-1", "created")
+    statuses = ("succeeded", "failed", "launch_failed", "interrupted")
+    for task, status in zip(state["tasks"], statuses):
+        task["status"] = status
+
+    assert all_tasks_terminal(state)
+    assert terminal_summary(state) == {
+        "total": 4,
+        "succeeded": 1,
+        "failed": 1,
+        "launch_failed": 1,
+        "interrupted": 1,
+        "task_ids": {
+            "succeeded": ["A01"],
+            "failed": ["A02"],
+            "launch_failed": ["B01"],
+            "interrupted": ["B02"],
+        },
+    }
 
 
 def test_atomic_state_store_replaces_complete_json(tmp_path):
