@@ -857,9 +857,18 @@ def _validate_action_snapshot(action: MigrationAction) -> None:
 
 def _preflight_migration(plan: MigrationPlan) -> None:
     source_root = plan.scan.source_root
+    output_root = plan.scan.output_root
     if not source_root.is_dir():
         raise MigrationBlockedError(
             f"legacy source directory does not exist: {source_root}"
+        )
+    if (
+        source_root == output_root
+        or source_root in output_root.parents
+        or output_root in source_root.parents
+    ):
+        raise MigrationBlockedError(
+            "legacy source and output root must not overlap"
         )
     for path in source_root.rglob("*"):
         if path.is_symlink():
@@ -1193,6 +1202,10 @@ def verify_migration(manifest_path: Path) -> VerificationResult:
             source = Path(row["old_path"])
             if source.exists() or source.is_symlink():
                 errors.append(f"failed run was not deleted: {source}")
+        else:
+            errors.append(
+                f"incomplete migration status {status} for {row['old_path']}"
+            )
     return VerificationResult(
         ok=not errors,
         checked_files=checked_files,

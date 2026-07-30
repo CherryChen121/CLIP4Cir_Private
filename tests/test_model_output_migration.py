@@ -376,6 +376,30 @@ def test_apply_rejects_cross_filesystem_plan(tmp_path, monkeypatch):
     assert checkpoint.exists()
 
 
+@pytest.mark.parametrize("output_location", ("same", "child", "parent"))
+def test_apply_rejects_overlapping_source_and_output_roots(
+    tmp_path,
+    output_location,
+):
+    if output_location == "same":
+        source = output = tmp_path / "models"
+    elif output_location == "child":
+        source = tmp_path / "models"
+        output = source / "outputs"
+    else:
+        output = tmp_path / "outputs"
+        source = output / "models"
+
+    run = source / "clip_finetuned_on_fiq_RN50x4_2026-01-01_00:00:00_000001"
+    checkpoint = _checkpoint(run / "saved_models/tuned.pt", b"weights")
+    plan = build_migration_plan(_scan(source, output))
+
+    with pytest.raises(MigrationBlockedError, match="must not overlap"):
+        apply_migration(plan)
+
+    assert checkpoint.exists()
+
+
 def test_apply_rejects_source_changed_after_plan(tmp_path):
     source = tmp_path / "models"
     run = source / "clip_finetuned_on_fiq_RN50x4_2026-01-01_00:00:00_000001"
@@ -418,6 +442,24 @@ def test_verify_detects_tampered_destination(tmp_path):
 
     assert not verification.ok
     assert any("sha256 mismatch" in error for error in verification.errors)
+
+
+def test_verify_rejects_incomplete_manifest_status(tmp_path):
+    manifest = tmp_path / "migration_manifest.csv"
+    manifest.write_text(
+        "old_path,new_path,dataset,stage,model_slug,run_id,status,size,"
+        "sha256,duplicate_group,canonical,reason\n"
+        "/old/checkpoint.pt,/new/checkpoint.pt,fashioniq,combiner,"
+        "rn50x4,run-1,planned-move,1,abc,,,\n",
+        encoding="utf-8",
+    )
+
+    verification = verify_migration(manifest)
+
+    assert not verification.ok
+    assert verification.errors == (
+        "incomplete migration status planned-move for /old/checkpoint.pt",
+    )
 
 
 def test_finalize_rejects_failed_verification_and_nonempty_source(tmp_path):
