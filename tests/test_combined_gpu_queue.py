@@ -26,6 +26,7 @@ from gpu_queue_core import (
     ProbeError,
     QueueSpec,
     TaskSpec,
+    acquire_lease,
     initial_state,
     mark_running,
 )
@@ -212,10 +213,10 @@ def test_terminate_refuses_signal_when_process_identity_changed(tmp_path):
     assert signals == []
 
 
-def _queue():
+def _queue(phase_size=2):
     tasks = []
     for phase in ("A", "B"):
-        for ordinal in (1, 2):
+        for ordinal in range(1, phase_size + 1):
             tasks.append(
                 TaskSpec(
                     task_id=f"{phase}{ordinal:02d}",
@@ -305,6 +306,34 @@ class Descendants:
         return None
 
 
+class MutableClock:
+    def __init__(self, value):
+        self.value = float(value)
+
+    def __call__(self):
+        return self.value
+
+
+def _seed_running(state, task_id, gpu_index, pid, tmp_path):
+    gpu = GpuSnapshot(gpu_index, f"GPU-{gpu_index}", 100, 10, (pid,))
+    mark_running(
+        state,
+        task_id,
+        {
+            "pid": pid,
+            "pgid": pid,
+            "start_ticks": pid,
+            "command_sha256": f"digest-{pid}",
+            "manifest_path": str(tmp_path / task_id / "manifest.json"),
+            "result_path": str(tmp_path / task_id / "result.json"),
+            "log_path": str(tmp_path / task_id / "task.log"),
+        },
+        gpu,
+        "start",
+    )
+    acquire_lease(state, gpu, task_id, "acquired")
+
+
 def test_multiple_idle_gpus_receive_tasks_in_gpu_and_queue_order(tmp_path):
     queue = _queue()
     state = initial_state(queue, "run-1", "created")
@@ -331,6 +360,157 @@ def test_multiple_idle_gpus_receive_tasks_in_gpu_and_queue_order(tmp_path):
     assert sleeps == [3, 3]
     assert any(event.startswith("TASK_START task=A01 phase=A gpu=2") for event in events)
     assert any(event.startswith("TASK_START task=A02 phase=A gpu=5") for event in events)
+
+
+def test_eight_eligible_gpus_create_only_four_running_leases(tmp_path):
+    queue = _queue(phase_size=6)
+    state = initial_state(queue, "run-1", "created")
+    launcher = DispatcherLauncher()
+    dispatcher = Dispatcher(
+        queue=queue,
+        state=state,
+        run_dir=tmp_path,
+        probe=StaticProbe(_eight_snapshots()),
+        idle_policy=EligiblePolicy(range(8)),
+        launcher=launcher,
+        proc_inspector=Descendants(),
+        state_store=MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "now",
+    )
+
+    dispatcher.run_cycle(sample_idle=True)
+
+    assert launcher.assignments == [
+        ("A01", 0),
+        ("A02", 1),
+        ("A03", 2),
+        ("A04", 3),
+    ]
+    assert [(lease["gpu_index"], lease["state"]) for lease in state["leases"]] == [
+        (0, "running"),
+        (1, "running"),
+        (2, "running"),
+        (3, "running"),
+    ]
+
+
+def test_running_and_cooldown_leases_together_block_a_fifth_gpu(tmp_path):
+    queue = _queue(phase_size=6)
+    state = initial_state(queue, "run-1", "created")
+    for task_id, gpu_index, pid in (
+        ("A01", 0, 101),
+        ("A02", 1, 102),
+        ("A03", 2, 103),
+        ("A04", 3, 104),
+    ):
+        _seed_running(state, task_id, gpu_index, pid, tmp_path)
+    state["tasks"][0]["status"] = "succeeded"
+    state["leases"][0].update(
+        state="cooldown",
+        task_id=None,
+        previous_task_id="A01",
+        cooldown_ready_at=999.0,
+    )
+    launcher = DispatcherLauncher()
+    dispatcher = Dispatcher(
+        queue,
+        state,
+        tmp_path,
+        StaticProbe(_eight_snapshots()),
+        EligiblePolicy([4]),
+        launcher,
+        Descendants(),
+        MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "now",
+        clock=lambda: 100.0,
+    )
+
+    dispatcher.run_cycle(sample_idle=True)
+
+    assert launcher.assignments == []
+    assert len(state["leases"]) == 4
+
+
+def test_successful_task_waits_sixty_seconds_then_reuses_same_gpu(tmp_path):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    _seed_running(state, "A01", 2, 101, tmp_path)
+    clock = MutableClock(100)
+    launcher = DispatcherLauncher(exit_codes={101: 0})
+    dispatcher = Dispatcher(
+        queue,
+        state,
+        tmp_path,
+        StaticProbe(_eight_snapshots()),
+        EligiblePolicy([]),
+        launcher,
+        Descendants(),
+        MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "now",
+        clock=clock,
+    )
+
+    dispatcher.run_cycle(sample_idle=False)
+    assert state["leases"][0]["state"] == "cooldown"
+    assert state["leases"][0]["cooldown_ready_at"] == 160.0
+    assert launcher.assignments == []
+
+    launcher.exit_codes = {}
+    clock.value = 159
+    dispatcher.run_cycle(sample_idle=False)
+    assert launcher.assignments == []
+
+    clock.value = 160
+    dispatcher.run_cycle(sample_idle=False)
+    assert launcher.assignments == [("A02", 2)]
+    assert state["leases"][0]["state"] == "running"
+    assert state["leases"][0]["task_id"] == "A02"
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        GpuSnapshot(2, "GPU-2", 0, 0, (7777,)),
+        GpuSnapshot(2, "GPU-2", 513, 0, ()),
+        GpuSnapshot(2, "GPU-2", 0, 6, ()),
+        GpuSnapshot(2, "GPU-changed", 0, 0, ()),
+    ],
+)
+def test_ready_cooldown_releases_gpu_that_is_not_safe_to_reuse(
+    tmp_path, replacement
+):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    _seed_running(state, "A01", 2, 101, tmp_path)
+    state["tasks"][0]["status"] = "succeeded"
+    state["leases"][0].update(
+        state="cooldown",
+        task_id=None,
+        previous_task_id="A01",
+        cooldown_ready_at=100.0,
+    )
+    launcher = DispatcherLauncher()
+    dispatcher = Dispatcher(
+        queue,
+        state,
+        tmp_path,
+        StaticProbe(_eight_snapshots({2: replacement})),
+        EligiblePolicy([]),
+        launcher,
+        Descendants(),
+        MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "now",
+        clock=lambda: 100.0,
+    )
+
+    dispatcher.run_cycle(sample_idle=False)
+
+    assert state["leases"] == []
+    assert launcher.assignments == []
 
 
 def test_second_final_probe_becoming_busy_cancels_launch(tmp_path):
@@ -365,7 +545,7 @@ def test_second_final_probe_becoming_busy_cancels_launch(tmp_path):
     assert launcher.assignments == []
 
 
-def test_launch_failure_pauses_queue_without_marking_task_running(tmp_path):
+def test_launch_failure_is_terminal_and_does_not_pause_queue(tmp_path):
     class FailingLauncher(DispatcherLauncher):
         def start(self, task, gpu, task_dir):
             raise ProcessIdentityError("worker disappeared")
@@ -389,14 +569,13 @@ def test_launch_failure_pauses_queue_without_marking_task_running(tmp_path):
 
     dispatcher.run_cycle(sample_idle=True)
 
-    assert state["paused_reason"] == {
-        "kind": "launch_error",
-        "task_id": "A01",
-        "detail": "worker disappeared",
-        "detected_at": "launch-time",
-    }
-    assert next(task for task in state["tasks"] if task["task_id"] == "A01")["status"] == "pending"
-    assert events[-1].startswith("QUEUE_PAUSE kind=launch_error task=A01")
+    task = next(task for task in state["tasks"] if task["task_id"] == "A01")
+    assert state["paused_reason"] is None
+    assert task["status"] == "launch_failed"
+    assert task["error"] == "worker disappeared"
+    assert task["gpu_index"] == 2
+    assert state["leases"] == []
+    assert any("TASK_END task=A01" in event and "LAUNCH_FAILED" in event for event in events)
 
 
 def test_foreign_pid_after_launch_is_logged_without_stopping_owned_task(tmp_path):
@@ -413,6 +592,7 @@ def test_foreign_pid_after_launch_is_logged_without_stopping_owned_task(tmp_path
         "log_path": str(tmp_path / "task.log"),
     }
     mark_running(state, "A01", launch, gpu, "start")
+    acquire_lease(state, gpu, "A01", "acquired")
     launcher = DispatcherLauncher()
     events = []
     dispatcher = Dispatcher(
@@ -494,25 +674,11 @@ def test_half_minute_cycle_does_not_log_gpu_audit(tmp_path):
     assert not any(event.startswith("GPU_AUDIT") for event in events)
 
 
-def test_failed_task_pauses_but_other_owned_job_keeps_running(tmp_path):
+def test_failed_task_enters_cooldown_while_other_owned_job_keeps_running(tmp_path):
     queue = _queue()
     state = initial_state(queue, "run-1", "created")
     for task_id, pid, gpu_index in (("A01", 101, 0), ("A02", 102, 1)):
-        mark_running(
-            state,
-            task_id,
-            {
-                "pid": pid,
-                "pgid": pid,
-                "start_ticks": pid,
-                "command_sha256": f"digest-{pid}",
-                "manifest_path": str(tmp_path / task_id / "manifest.json"),
-                "result_path": str(tmp_path / task_id / "result.json"),
-                "log_path": str(tmp_path / task_id / "task.log"),
-            },
-            GpuSnapshot(gpu_index, f"GPU-{gpu_index}", 100, 10, (pid,)),
-            "start",
-        )
+        _seed_running(state, task_id, gpu_index, pid, tmp_path)
     launcher = DispatcherLauncher(exit_codes={101: 1, 102: None})
     snapshots = _eight_snapshots(
         {
@@ -537,31 +703,23 @@ def test_failed_task_pauses_but_other_owned_job_keeps_running(tmp_path):
 
     dispatcher.run_cycle(sample_idle=False)
 
-    assert state["paused_reason"]["kind"] == "task_failed"
+    assert state["paused_reason"] is None
     assert next(task for task in state["tasks"] if task["task_id"] == "A02")["status"] == "running"
+    assert next(
+        lease for lease in state["leases"] if lease["gpu_index"] == 0
+    )["state"] == "cooldown"
     assert launcher.terminated == []
     assert any("TASK_END task=A01" in event and "result=FAILED" in event for event in events)
-    assert any(event.startswith("QUEUE_PAUSE kind=task_failed task=A01") for event in events)
+    assert not any(event.startswith("QUEUE_PAUSE") for event in events)
 
 
 def test_successful_task_exit_logs_task_end(tmp_path):
     queue = _queue()
     state = initial_state(queue, "run-1", "created")
-    mark_running(
-        state,
-        "A01",
-        {
-            "pid": 101,
-            "pgid": 101,
-            "start_ticks": 10,
-            "command_sha256": "owned",
-            "manifest_path": str(tmp_path / "manifest.json"),
-            "result_path": str(tmp_path / "result.json"),
-            "log_path": str(tmp_path / "task.log"),
-        },
-        GpuSnapshot(0, "GPU-0", 100, 10, (101,)),
-        "2026-07-30T10:00:00+0800",
-    )
+    _seed_running(state, "A01", 0, 101, tmp_path)
+    next(task for task in state["tasks"] if task["task_id"] == "A01")[
+        "started_at"
+    ] = "2026-07-30T10:00:00+0800"
     events = []
     dispatcher = Dispatcher(
         queue=queue,
@@ -586,21 +744,7 @@ def test_successful_task_exit_logs_task_end(tmp_path):
 def test_resume_keeps_exact_live_worker_running(tmp_path):
     queue = _queue()
     state = initial_state(queue, "run-1", "created")
-    mark_running(
-        state,
-        "A01",
-        {
-            "pid": 101,
-            "pgid": 101,
-            "start_ticks": 10,
-            "command_sha256": "owned",
-            "manifest_path": str(tmp_path / "manifest.json"),
-            "result_path": str(tmp_path / "result.json"),
-            "log_path": str(tmp_path / "task.log"),
-        },
-        GpuSnapshot(0, "GPU-0", 100, 10, (101,)),
-        "start",
-    )
+    _seed_running(state, "A01", 0, 101, tmp_path)
     dispatcher = Dispatcher(
         queue, state, tmp_path, StaticProbe(_eight_snapshots()),
         EligiblePolicy([]), DispatcherLauncher(), Descendants(), MemoryStore(),
@@ -613,28 +757,14 @@ def test_resume_keeps_exact_live_worker_running(tmp_path):
     assert state["paused_reason"] is None
 
 
-def test_resume_marks_missing_worker_interrupted_and_pauses(tmp_path):
+def test_resume_marks_missing_worker_interrupted_and_releases_lease(tmp_path):
     class MissingLauncher(DispatcherLauncher):
         def poll(self, identity, result_path):
             raise ProcessIdentityError("missing")
 
     queue = _queue()
     state = initial_state(queue, "run-1", "created")
-    mark_running(
-        state,
-        "A01",
-        {
-            "pid": 101,
-            "pgid": 101,
-            "start_ticks": 10,
-            "command_sha256": "owned",
-            "manifest_path": str(tmp_path / "manifest.json"),
-            "result_path": str(tmp_path / "result.json"),
-            "log_path": str(tmp_path / "task.log"),
-        },
-        GpuSnapshot(0, "GPU-0", 100, 10, (101,)),
-        "start",
-    )
+    _seed_running(state, "A01", 0, 101, tmp_path)
     events = []
     dispatcher = Dispatcher(
         queue, state, tmp_path, StaticProbe(_eight_snapshots()),
@@ -647,12 +777,10 @@ def test_resume_marks_missing_worker_interrupted_and_pauses(tmp_path):
     dispatcher.reconcile_resume()
 
     assert next(task for task in state["tasks"] if task["task_id"] == "A01")["status"] == "interrupted"
-    assert state["paused_reason"]["kind"] == "process_identity_unverified"
+    assert state["paused_reason"] is None
+    assert state["leases"] == []
     assert any("TASK_END task=A01" in event and "result=INTERRUPTED" in event for event in events)
-    assert any(
-        event.startswith("QUEUE_PAUSE kind=process_identity_unverified task=A01")
-        for event in events
-    )
+    assert not any(event.startswith("QUEUE_PAUSE") for event in events)
 
 
 def test_completed_queue_logs_completion_once(tmp_path):

@@ -208,6 +208,19 @@ def test_busy_sample_resets_consecutive_idle_count():
     assert 0 in policy.observe(_snapshots())
 
 
+def test_released_gpu_must_accumulate_five_new_idle_samples():
+    policy = IdlePolicy(expected_indices=range(8))
+    for _ in range(5):
+        policy.observe(_snapshots())
+    assert policy.idle_streak("GPU-0") == 5
+
+    policy.reset("GPU-0")
+
+    for _ in range(4):
+        assert 0 not in policy.observe(_snapshots())
+    assert 0 in policy.observe(_snapshots())
+
+
 def test_idle_policy_rejects_gpu_uuid_mapping_change():
     policy = IdlePolicy(expected_indices=range(8))
     policy.observe(_snapshots())

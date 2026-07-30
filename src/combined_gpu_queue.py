@@ -20,17 +20,23 @@ try:
         AtomicStateStore,
         GpuSnapshot,
         IdlePolicy,
+        MAX_GPU_LEASES,
         ProbeError,
         QueueSpec,
         ResumeError,
         TaskSpec,
+        acquire_lease,
         initial_state,
+        lease_for_gpu,
         mark_running,
+        mark_lease_cooldown,
         next_pending_task,
         parse_combined_queue,
         preflight_queue,
         record_exit,
         record_interrupted,
+        record_launch_failed,
+        release_lease,
         validate_resume_state,
     )
     from gpu_queue_audit import (
@@ -44,17 +50,23 @@ except ImportError:
         AtomicStateStore,
         GpuSnapshot,
         IdlePolicy,
+        MAX_GPU_LEASES,
         ProbeError,
         QueueSpec,
         ResumeError,
         TaskSpec,
+        acquire_lease,
         initial_state,
+        lease_for_gpu,
         mark_running,
+        mark_lease_cooldown,
         next_pending_task,
         parse_combined_queue,
         preflight_queue,
         record_exit,
         record_interrupted,
+        record_launch_failed,
+        release_lease,
         validate_resume_state,
     )
     from src.gpu_queue_audit import (
@@ -281,6 +293,9 @@ class Dispatcher:
         state_store,
         sleeper=time.sleep,
         now=lambda: time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        clock=time.time,
+        cooldown_seconds=60,
+        max_gpu_leases=MAX_GPU_LEASES,
         owner_lookup=_default_owner_lookup,
         event_logger=lambda message: None,
     ):
@@ -294,6 +309,9 @@ class Dispatcher:
         self.state_store = state_store
         self.sleeper = sleeper
         self.now = now
+        self.clock = clock
+        self.cooldown_seconds = float(cooldown_seconds)
+        self.max_gpu_leases = int(max_gpu_leases)
         self.owner_lookup = owner_lookup
         self.event_logger = event_logger
         self._task_specs = {task.task_id: task for task in queue.tasks}
@@ -331,20 +349,33 @@ class Dispatcher:
     def _poll_results(self):
         for task in list(self._running_tasks()):
             identity = self._identity(task)
-            was_paused = bool(self.state.get("paused_reason"))
             try:
                 return_code = self.launcher.poll(identity, Path(task["result_path"]))
-            except ProcessIdentityError:
+            except ProcessIdentityError as exc:
                 record_interrupted(self.state, task["task_id"], self.now())
+                task["error"] = " ".join(str(exc).split())
+                lease = lease_for_gpu(self.state, int(task["gpu_index"]))
+                if lease is not None:
+                    self._release(lease, "interrupted", save=False)
                 self._save()
                 self.event_logger(format_task_end(task))
-                self._log_pause_if_new(was_paused)
                 continue
             if return_code is not None:
                 record_exit(self.state, task["task_id"], return_code, self.now())
+                lease = mark_lease_cooldown(
+                    self.state,
+                    task["task_id"],
+                    self.clock() + self.cooldown_seconds,
+                    self.now(),
+                )
                 self._save()
                 self.event_logger(format_task_end(task))
-                self._log_pause_if_new(was_paused)
+                self.event_logger(
+                    f"GPU_LEASE_COOLDOWN gpu={lease['gpu_index']} "
+                    f"gpu_uuid={lease['gpu_uuid']} "
+                    f"previous_task={lease['previous_task_id']} "
+                    f"cooldown_ready_at={lease['cooldown_ready_at']}"
+                )
 
     @staticmethod
     def _gpu(snapshots: Tuple[GpuSnapshot, ...], index: int) -> Optional[GpuSnapshot]:
@@ -359,6 +390,129 @@ class Dispatcher:
         if second is None or second.uuid != expected_uuid or not self.idle_policy.is_idle_now(second):
             return None
         return second
+
+    @staticmethod
+    def _reuse_rejection(
+        snapshot: Optional[GpuSnapshot],
+        expected_uuid: str,
+    ) -> Optional[str]:
+        if snapshot is None:
+            return "gpu_missing"
+        if snapshot.uuid != expected_uuid:
+            return "uuid_changed"
+        if snapshot.compute_pids:
+            return "foreign_pid"
+        if snapshot.memory_used_mib > 512:
+            return "memory_above_limit"
+        if snapshot.utilization_percent > 5:
+            return "utilization_above_limit"
+        return None
+
+    def _release(self, lease: dict, reason: str, *, save: bool = True) -> None:
+        released = release_lease(self.state, int(lease["gpu_index"]))
+        reset = getattr(self.idle_policy, "reset", None)
+        if reset is not None:
+            reset(released["gpu_uuid"])
+        if save:
+            self._save()
+        self.event_logger(
+            f"GPU_LEASE_RELEASED gpu={released['gpu_index']} "
+            f"gpu_uuid={released['gpu_uuid']} reason={reason}"
+        )
+
+    def _dispatch_on_gpu(
+        self,
+        pending: dict,
+        gpu: GpuSnapshot,
+        *,
+        reuse: bool,
+    ) -> bool:
+        spec = self._task_specs[pending["task_id"]]
+        try:
+            launch = self.launcher.start(
+                spec,
+                gpu,
+                self.run_dir / "tasks" / spec.task_id,
+            )
+        except (OSError, ProcessIdentityError, ValueError) as exc:
+            record_launch_failed(
+                self.state,
+                spec.task_id,
+                str(exc),
+                self.now(),
+                gpu,
+            )
+            if reuse:
+                lease = lease_for_gpu(self.state, gpu.index)
+                if lease is not None:
+                    self._release(lease, "launch_failed", save=False)
+            self._save()
+            self.event_logger(format_task_end(pending))
+            return False
+
+        mark_running(
+            self.state,
+            spec.task_id,
+            launch.state_fields(),
+            gpu,
+            self.now(),
+        )
+        if reuse:
+            lease = lease_for_gpu(self.state, gpu.index)
+            if lease is None or lease.get("state") != "cooldown":
+                raise ResumeError(f"GPU {gpu.index} has no reusable cooldown lease")
+            lease.update(
+                {
+                    "state": "running",
+                    "task_id": spec.task_id,
+                    "cooldown_ready_at": None,
+                    "updated_at": self.now(),
+                }
+            )
+            event = "GPU_LEASE_REUSED"
+        else:
+            lease = acquire_lease(self.state, gpu, spec.task_id, self.now())
+            event = "GPU_LEASE_ACQUIRED"
+        self._save()
+        self.event_logger(
+            f"{event} gpu={gpu.index} gpu_uuid={gpu.uuid} task={spec.task_id}"
+        )
+        self.event_logger(format_task_start(pending))
+        return True
+
+    def _process_ready_cooldowns(
+        self,
+        snapshots: Tuple[GpuSnapshot, ...],
+    ) -> None:
+        ready = sorted(
+            (
+                lease
+                for lease in self.state.get("leases", [])
+                if lease.get("state") == "cooldown"
+                and float(lease["cooldown_ready_at"]) <= self.clock()
+            ),
+            key=lambda lease: int(lease["gpu_index"]),
+        )
+        for lease in ready:
+            pending = next_pending_task(self.state)
+            if pending is None:
+                continue
+            snapshot = self._gpu(snapshots, int(lease["gpu_index"]))
+            reason = self._reuse_rejection(snapshot, lease["gpu_uuid"])
+            if reason is not None:
+                self._release(lease, reason)
+                continue
+            try:
+                final_gpu = self._final_idle_check(
+                    int(lease["gpu_index"]),
+                    lease["gpu_uuid"],
+                )
+            except ProbeError:
+                raise
+            if final_gpu is None:
+                self._release(lease, "final_check_failed")
+                continue
+            self._dispatch_on_gpu(pending, final_gpu, reuse=True)
 
     def _audit_snapshots(self, snapshots: Tuple[GpuSnapshot, ...]) -> None:
         running_by_gpu = {
@@ -406,11 +560,22 @@ class Dispatcher:
                 return
         if sample_idle:
             self._audit_snapshots(snapshots)
-        if self.state.get("paused_reason") or not sample_idle:
+        if self.state.get("paused_reason"):
             return
-        assigned = {task["gpu_index"] for task in self._running_tasks()}
+        try:
+            self._process_ready_cooldowns(snapshots)
+        except ProbeError as exc:
+            self._pause_probe_error(exc)
+            return
+        if not sample_idle:
+            return
+        leased = {
+            int(lease["gpu_index"]) for lease in self.state.get("leases", [])
+        }
         for index in candidates:
-            if index in assigned:
+            if len(self.state.get("leases", [])) >= self.max_gpu_leases:
+                break
+            if index in leased:
                 continue
             pending = next_pending_task(self.state)
             if pending is None:
@@ -425,33 +590,9 @@ class Dispatcher:
                 return
             if final_gpu is None:
                 continue
-            spec = self._task_specs[pending["task_id"]]
-            try:
-                launch = self.launcher.start(
-                    spec,
-                    final_gpu,
-                    self.run_dir / "tasks" / spec.task_id,
-                )
-            except (OSError, ProcessIdentityError, ValueError) as exc:
-                self.state["paused_reason"] = {
-                    "kind": "launch_error",
-                    "task_id": spec.task_id,
-                    "detail": str(exc),
-                    "detected_at": self.now(),
-                }
-                self._save()
-                self.event_logger(format_queue_pause(self.state["paused_reason"]))
-                return
-            mark_running(
-                self.state,
-                spec.task_id,
-                launch.state_fields(),
-                final_gpu,
-                self.now(),
-            )
-            self._save()
-            self.event_logger(format_task_start(pending))
-            assigned.add(index)
+            self._dispatch_on_gpu(pending, final_gpu, reuse=False)
+            if lease_for_gpu(self.state, index) is not None:
+                leased.add(index)
 
     def reconcile_resume(self) -> None:
         self._poll_results()
