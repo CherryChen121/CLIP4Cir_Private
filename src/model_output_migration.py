@@ -286,8 +286,8 @@ def _classify_run(
     if nonempty_metrics:
         return replace(
             run,
-            classification="unresolved",
-            reasons=("nonempty-metrics-without-checkpoint",),
+            classification="valid",
+            reasons=("metrics-only-retained",),
         )
 
     if age_seconds < 24 * 60 * 60:
