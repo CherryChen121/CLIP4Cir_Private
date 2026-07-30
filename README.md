@@ -287,9 +287,11 @@ PYTHONPATH=src python scripts/organize_model_outputs.py --finalize
 
 `--apply` is blocked while an old training process may still write to
 `models/`. It migrates through `outputs/.staging`, preserves per-run metadata,
-and replaces byte-identical checkpoints with hard links. `--finalize` first
-verifies every migrated hash and duplicate inode, then removes only an empty
-legacy source tree using guarded directory removal.
+retains metrics-only runs, and replaces byte-identical checkpoints with hard
+links. Recognized reports keep their source-relative directories below
+`outputs/reports/legacy/`, so same-named reports are never overwritten.
+`--finalize` first verifies every migrated hash and duplicate inode, then
+removes only an empty legacy source tree using guarded directory removal.
 
 ---
 

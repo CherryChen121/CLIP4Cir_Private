@@ -185,6 +185,37 @@ def test_xlsx_outside_run_is_classified_as_legacy_report(tmp_path):
     assert result.unknown_paths == ()
 
 
+def test_same_named_legacy_reports_keep_relative_paths(tmp_path):
+    source = tmp_path / "models"
+    output = tmp_path / "outputs"
+    clip_report = _write(
+        source / "clip_finetuned_on_fiq_ViT-B/summary.xlsx",
+        b"clip",
+    )
+    combiner_report = _write(
+        source / "combiner_trained_on_fiq_ViT-B/summary.xlsx",
+        b"combiner",
+    )
+
+    plan = build_migration_plan(_scan(source, output))
+    report_actions = {
+        action.source: action
+        for action in plan.actions
+        if action.kind == "report"
+    }
+
+    assert report_actions[clip_report].destination == (
+        output / "reports/legacy/clip_finetuned_on_fiq_ViT-B/summary.xlsx"
+    )
+    assert report_actions[combiner_report].destination == (
+        output / "reports/legacy/combiner_trained_on_fiq_ViT-B/summary.xlsx"
+    )
+    assert all(
+        action.status == "planned-move"
+        for action in report_actions.values()
+    )
+
+
 def test_nonempty_corrupt_checkpoint_is_unresolved(tmp_path):
     source = tmp_path / "models"
     run = source / "clip_finetuned_on_fiq_RN50x4_2026-01-01_00:00:00_000001"
