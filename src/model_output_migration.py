@@ -4,10 +4,12 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import struct
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 import zipfile
 
 from output_paths import slugify_component
@@ -27,6 +29,10 @@ class LegacyPathError(ValueError):
 
 
 class SourceChangedError(RuntimeError):
+    pass
+
+
+class MigrationBlockedError(RuntimeError):
     pass
 
 
@@ -96,6 +102,14 @@ class MigrationPlan:
         return any(
             action.status in blocking_statuses for action in self.actions
         )
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    ok: bool
+    checked_files: int
+    checked_bytes: int
+    errors: Tuple[str, ...]
 
 
 def _legacy_run_id(stamp: str) -> Tuple[str, Optional[int]]:
@@ -728,3 +742,457 @@ def write_migration_reports(
     csv_temporary.replace(csv_path)
     json_temporary.replace(json_path)
     return csv_path, json_path
+
+
+def find_legacy_writer_pids(
+    project_root: Path,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> Tuple[int, ...]:
+    project_root = project_root.resolve()
+    target_scripts = {
+        (project_root / "src" / "clip_fine_tune.py").resolve(),
+        (project_root / "src" / "combiner_train.py").resolve(),
+    }
+    matches = []
+    try:
+        process_directories = sorted(
+            (
+                path for path in proc_root.iterdir()
+                if path.name.isdigit() and path.is_dir()
+            ),
+            key=lambda path: int(path.name),
+        )
+    except (FileNotFoundError, PermissionError):
+        return ()
+
+    for process_directory in process_directories:
+        try:
+            arguments = [
+                part.decode("utf-8", errors="surrogateescape")
+                for part in (process_directory / "cmdline").read_bytes().split(b"\0")
+                if part
+            ]
+            cwd = (process_directory / "cwd").resolve(strict=True)
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        for argument in arguments:
+            if not argument.endswith(".py"):
+                continue
+            candidate = Path(argument)
+            if not candidate.is_absolute():
+                candidate = cwd / candidate
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved in target_scripts:
+                matches.append(int(process_directory.name))
+                break
+    return tuple(matches)
+
+
+def _nearest_existing_parent(path: Path) -> Path:
+    candidate = path.resolve()
+    while not candidate.exists():
+        if candidate == candidate.parent:
+            raise MigrationBlockedError(
+                f"no existing parent for output root: {path}"
+            )
+        candidate = candidate.parent
+    return candidate
+
+
+def _same_filesystem(left: Path, right: Path) -> bool:
+    return left.stat().st_dev == _nearest_existing_parent(right).stat().st_dev
+
+
+def _validate_action_snapshot(action: MigrationAction) -> None:
+    if action.kind not in {"file", "checkpoint", "report"}:
+        return
+    stat_result = action.source.stat()
+    if (
+        stat_result.st_size != action.size
+        or stat_result.st_mtime_ns != action.mtime_ns
+    ):
+        raise SourceChangedError(
+            f"source snapshot changed before apply: {action.source}"
+        )
+    if sha256_file(action.source) != action.sha256:
+        raise SourceChangedError(
+            f"source hash changed before apply: {action.source}"
+        )
+
+
+def _preflight_migration(plan: MigrationPlan) -> None:
+    source_root = plan.scan.source_root
+    if not source_root.is_dir():
+        raise MigrationBlockedError(
+            f"legacy source directory does not exist: {source_root}"
+        )
+    for path in source_root.rglob("*"):
+        if path.is_symlink():
+            raise MigrationBlockedError(
+                f"symbolic link found in legacy source: {path}"
+            )
+    if plan.has_blockers:
+        raise MigrationBlockedError(
+            "migration plan contains active, unresolved, or error actions"
+        )
+    if find_legacy_writer_pids(source_root.parent):
+        raise MigrationBlockedError(
+            "legacy training writer is still running"
+        )
+    if not _same_filesystem(source_root, plan.scan.output_root):
+        raise MigrationBlockedError(
+            "source and output root must be on the same filesystem"
+        )
+    for run in plan.scan.runs:
+        if run.classification == "valid" and run.destination.exists():
+            raise MigrationBlockedError(
+                f"migration destination already exists: {run.destination}"
+            )
+    for action in plan.actions:
+        if (
+            action.destination is not None
+            and action.kind == "report"
+            and action.destination.exists()
+        ):
+            raise MigrationBlockedError(
+                f"migration destination already exists: {action.destination}"
+            )
+        _validate_action_snapshot(action)
+        if action.kind == "failed-run":
+            if (
+                _tree_size(action.source) != action.size
+                or _newest_mtime_ns(action.source) != action.mtime_ns
+            ):
+                raise SourceChangedError(
+                    f"failed-run source changed before apply: {action.source}"
+                )
+
+
+def _actions_for_run(
+    plan: MigrationPlan,
+    run: LegacyRun,
+) -> Tuple[MigrationAction, ...]:
+    return tuple(
+        action for action in plan.actions
+        if (
+            action.kind in {"file", "checkpoint"}
+            and (
+                action.source == run.source
+                or run.source in action.source.parents
+            )
+        )
+    )
+
+
+def _staged_file_for_action(
+    run: LegacyRun,
+    staged_root: Path,
+    action: MigrationAction,
+) -> Path:
+    if action.destination is None:
+        raise ValueError(f"action has no destination: {action.source}")
+    return staged_root / action.destination.relative_to(run.destination)
+
+
+def _verify_file(path: Path, action: MigrationAction) -> None:
+    if not path.is_file():
+        raise MigrationBlockedError(f"migrated file is missing: {path}")
+    if path.stat().st_size != action.size:
+        raise MigrationBlockedError(f"migrated file size mismatch: {path}")
+    if sha256_file(path) != action.sha256:
+        raise MigrationBlockedError(f"migrated file hash mismatch: {path}")
+
+
+def _write_legacy_run_manifest(run: LegacyRun) -> None:
+    manifest = run.destination / "run_manifest.json"
+    temporary = run.destination / ".run_manifest.json.tmp"
+    payload = {
+        "dataset": run.dataset_slug,
+        "dataset_slug": run.dataset_slug,
+        "training_stage": run.stage,
+        "model_name": run.model_name,
+        "model_slug": run.model_slug,
+        "run_id": run.run_id,
+        "pid": run.pid,
+        "checkpoint_dir": "checkpoints",
+        "legacy_source": str(run.source),
+    }
+    temporary.write_text(
+        json.dumps(payload, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(manifest)
+
+
+def _restore_run(run: LegacyRun, current_path: Path) -> None:
+    manifest = current_path / "run_manifest.json"
+    if manifest.exists():
+        manifest.unlink()
+    temporary_manifest = current_path / ".run_manifest.json.tmp"
+    if temporary_manifest.exists():
+        temporary_manifest.unlink()
+    checkpoints = current_path / "checkpoints"
+    saved_models = current_path / "saved_models"
+    if checkpoints.exists() and not saved_models.exists():
+        checkpoints.replace(saved_models)
+    run.source.parent.mkdir(parents=True, exist_ok=True)
+    current_path.replace(run.source)
+
+
+def _remove_empty_tree(path: Path) -> None:
+    if not path.exists():
+        return
+    directories = sorted(
+        (item for item in path.rglob("*") if item.is_dir()),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    )
+    for directory in directories:
+        try:
+            directory.rmdir()
+        except OSError:
+            continue
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def _deduplicate_checkpoint(action: MigrationAction) -> None:
+    if action.destination is None or not action.canonical:
+        raise MigrationBlockedError(
+            f"duplicate action lacks paths: {action.source}"
+        )
+    duplicate = action.destination
+    canonical = Path(action.canonical)
+    _verify_file(canonical, replace(action, destination=canonical))
+    _verify_file(duplicate, action)
+    temporary = duplicate.parent / f".{duplicate.name}.dedupe-link"
+    if temporary.exists():
+        raise MigrationBlockedError(
+            f"temporary deduplication link already exists: {temporary}"
+        )
+    os.link(canonical, temporary)
+    temporary.replace(duplicate)
+    canonical_stat = canonical.stat()
+    duplicate_stat = duplicate.stat()
+    if (
+        canonical_stat.st_dev != duplicate_stat.st_dev
+        or canonical_stat.st_ino != duplicate_stat.st_ino
+    ):
+        raise MigrationBlockedError(
+            f"deduplication inode verification failed: {duplicate}"
+        )
+
+
+def _updated_after_apply(plan: MigrationPlan) -> MigrationPlan:
+    status_mapping = {
+        "planned-move": "moved",
+        "planned-deduplicate": "deduplicated",
+        "planned-delete-failed": "deleted-failed",
+    }
+    return replace(
+        plan,
+        actions=tuple(
+            replace(
+                action,
+                status=status_mapping.get(action.status, action.status),
+            )
+            for action in plan.actions
+        ),
+    )
+
+
+def apply_migration(plan: MigrationPlan) -> MigrationPlan:
+    _preflight_migration(plan)
+    output_root = plan.scan.output_root
+    staging_root = output_root / ".staging"
+    valid_runs = tuple(
+        run for run in plan.scan.runs if run.classification == "valid"
+    )
+    run_locations: Dict[Path, Path] = {}
+    report_locations: Dict[Path, Path] = {}
+
+    try:
+        for run in valid_runs:
+            staged = (
+                staging_root
+                / run.dataset_slug
+                / run.stage
+                / run.model_slug
+                / run.run_id
+            )
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            run.source.replace(staged)
+            run_locations[run.source] = staged
+            saved_models = staged / "saved_models"
+            if saved_models.exists():
+                saved_models.replace(staged / "checkpoints")
+            for action in _actions_for_run(plan, run):
+                _verify_file(
+                    _staged_file_for_action(run, staged, action),
+                    action,
+                )
+
+        for action in plan.actions:
+            if action.kind != "report" or action.destination is None:
+                continue
+            staged = staging_root / "reports" / action.source.name
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            action.source.replace(staged)
+            report_locations[action.source] = staged
+            _verify_file(staged, action)
+
+        for run in valid_runs:
+            staged = run_locations[run.source]
+            run.destination.parent.mkdir(parents=True, exist_ok=True)
+            staged.replace(run.destination)
+            run_locations[run.source] = run.destination
+
+        for action in plan.actions:
+            if action.kind != "report" or action.destination is None:
+                continue
+            staged = report_locations[action.source]
+            action.destination.parent.mkdir(parents=True, exist_ok=True)
+            staged.replace(action.destination)
+            report_locations[action.source] = action.destination
+
+        for run in valid_runs:
+            _write_legacy_run_manifest(run)
+    except Exception:
+        for action in reversed(plan.actions):
+            if action.kind != "report":
+                continue
+            current = report_locations.get(action.source)
+            if current is not None and current.exists():
+                action.source.parent.mkdir(parents=True, exist_ok=True)
+                current.replace(action.source)
+        for run in reversed(valid_runs):
+            current = run_locations.get(run.source)
+            if current is not None and current.exists():
+                _restore_run(run, current)
+        _remove_empty_tree(staging_root)
+        raise
+
+    write_migration_reports(plan, output_root)
+
+    for action in plan.actions:
+        if action.status == "planned-deduplicate":
+            _deduplicate_checkpoint(action)
+
+    source_root = plan.scan.source_root
+    resolved_source_root = source_root.resolve()
+    for action in plan.actions:
+        if action.status != "planned-delete-failed":
+            continue
+        resolved_failed = action.source.resolve()
+        if resolved_source_root not in resolved_failed.parents:
+            raise MigrationBlockedError(
+                f"failed run escapes source root: {action.source}"
+            )
+        shutil.rmtree(resolved_failed)
+
+    applied = _updated_after_apply(plan)
+    write_migration_reports(applied, output_root)
+    _remove_empty_tree(staging_root)
+    return applied
+
+
+def verify_migration(manifest_path: Path) -> VerificationResult:
+    errors: List[str] = []
+    checked_files = 0
+    checked_bytes = 0
+    if not manifest_path.is_file():
+        return VerificationResult(
+            ok=False,
+            checked_files=0,
+            checked_bytes=0,
+            errors=(f"migration manifest is missing: {manifest_path}",),
+        )
+
+    with manifest_path.open(encoding="utf-8", newline="") as file:
+        rows = list(csv.DictReader(file))
+    for row in rows:
+        status = row["status"]
+        if status in {"moved", "deduplicated"}:
+            destination = Path(row["new_path"])
+            if not destination.is_file():
+                errors.append(f"migrated file is missing: {destination}")
+                continue
+            expected_size = int(row["size"])
+            actual_size = destination.stat().st_size
+            if actual_size != expected_size:
+                errors.append(
+                    f"size mismatch for {destination}: "
+                    f"{actual_size} != {expected_size}"
+                )
+                continue
+            try:
+                actual_hash = sha256_file(destination)
+            except (OSError, SourceChangedError) as error:
+                errors.append(str(error))
+                continue
+            if actual_hash != row["sha256"]:
+                errors.append(f"sha256 mismatch for {destination}")
+                continue
+            if status == "deduplicated":
+                canonical = Path(row["canonical"])
+                if not canonical.is_file():
+                    errors.append(
+                        f"canonical checkpoint is missing: {canonical}"
+                    )
+                    continue
+                canonical_stat = canonical.stat()
+                destination_stat = destination.stat()
+                if (
+                    canonical_stat.st_dev != destination_stat.st_dev
+                    or canonical_stat.st_ino != destination_stat.st_ino
+                ):
+                    errors.append(
+                        f"duplicate inode mismatch for {destination}"
+                    )
+                    continue
+            checked_files += 1
+            checked_bytes += actual_size
+        elif status == "deleted-failed":
+            source = Path(row["old_path"])
+            if source.exists() or source.is_symlink():
+                errors.append(f"failed run was not deleted: {source}")
+    return VerificationResult(
+        ok=not errors,
+        checked_files=checked_files,
+        checked_bytes=checked_bytes,
+        errors=tuple(errors),
+    )
+
+
+def finalize_source(
+    source_root: Path,
+    verification: VerificationResult,
+) -> None:
+    if not verification.ok:
+        raise MigrationBlockedError(
+            "migration verification did not pass"
+        )
+    if not source_root.exists():
+        return
+    unexpected = tuple(
+        path for path in source_root.rglob("*")
+        if path.is_file() or path.is_symlink()
+    )
+    if unexpected:
+        raise MigrationBlockedError(
+            f"legacy source is not empty: {unexpected[0]}"
+        )
+    directories = sorted(
+        (path for path in source_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for directory in directories:
+        directory.rmdir()
+    source_root.rmdir()
