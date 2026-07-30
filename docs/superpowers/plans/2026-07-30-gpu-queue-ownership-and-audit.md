@@ -59,7 +59,7 @@ def test_idle_policy_exposes_streak_by_gpu_uuid():
 Run:
 
 ```bash
-/data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest tests/test_gpu_queue_core.py::test_idle_policy_exposes_streak_by_gpu_uuid -q
+PYTHONPATH=src /data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest tests/test_gpu_queue_core.py::test_idle_policy_exposes_streak_by_gpu_uuid -q
 ```
 
 Expected: fail because `IdlePolicy` has no `idle_streak` method.
@@ -170,7 +170,7 @@ def test_formats_task_and_pause_events():
 Run:
 
 ```bash
-/data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest tests/test_gpu_queue_audit.py -q
+PYTHONPATH=src /data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest tests/test_gpu_queue_audit.py -q
 ```
 
 Expected: collection fails because `src.gpu_queue_audit` does not exist.
@@ -195,7 +195,7 @@ Create `src/gpu_queue_audit.py`. It must:
 Run:
 
 ```bash
-/data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest tests/test_gpu_queue_audit.py tests/test_gpu_queue_core.py -q
+PYTHONPATH=src /data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest tests/test_gpu_queue_audit.py tests/test_gpu_queue_core.py -q
 ```
 
 Expected: all selected tests pass.
@@ -309,7 +309,7 @@ For `ProcessIdentityError`, assert `TASK_END ... result=INTERRUPTED` and `QUEUE_
 Run:
 
 ```bash
-/data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest \
+PYTHONPATH=src /data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest \
   tests/test_combined_gpu_queue.py::test_foreign_pid_after_launch_is_logged_without_stopping_owned_task \
   tests/test_combined_gpu_queue.py -q
 ```
@@ -345,7 +345,7 @@ Let logger write failures propagate so the dispatcher exits rather than continue
 Run:
 
 ```bash
-/data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest tests/test_combined_gpu_queue.py -q
+PYTHONPATH=src /data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest tests/test_combined_gpu_queue.py -q
 ```
 
 Expected: all dispatcher tests pass.
@@ -355,7 +355,7 @@ Expected: all dispatcher tests pass.
 Run:
 
 ```bash
-/data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest -q
+PYTHONPATH=src /data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest -q
 ```
 
 Expected: all tests pass; only the repository's pre-existing dependency warnings may remain.
@@ -416,7 +416,7 @@ git commit -m "docs: explain persistent GPU ownership auditing"
 Run:
 
 ```bash
-/data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest -q
+PYTHONPATH=src /data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest -q
 ./run_combined_gpu_queue.sh dry-run
 ```
 
