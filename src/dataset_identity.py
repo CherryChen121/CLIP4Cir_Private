@@ -165,3 +165,43 @@ def resolve_fashioniq_training_identity(
         dataset_root_resolved=resolved_root,
         output_dataset=output_dataset,
     )
+
+
+def resolve_fashioniq_evaluation_identity(
+    *,
+    project_root: Path,
+    dress_types: Sequence[str],
+    split: str,
+    dataset_root: Optional[Union[str, Path]],
+    output_dataset: Optional[str],
+    root_resolver: Callable[
+        [str, str, Optional[Union[str, Path]]], Path
+    ],
+) -> DatasetIdentity:
+    resolved_roots = {
+        root_resolver(category, split, dataset_root).resolve()
+        for category in dress_types
+    }
+    if len(resolved_roots) != 1:
+        raise DatasetIdentityError(
+            "FashionIQ evaluation categories resolved to multiple dataset "
+            "roots: "
+            + ", ".join(sorted(str(path) for path in resolved_roots))
+        )
+
+    resolved_root = resolved_roots.pop()
+    requested_root = dataset_root
+    project_link = project_root / "fashionIQ_dataset"
+    if requested_root is None and (
+        project_link.exists() or project_link.is_symlink()
+    ):
+        if project_link.resolve() == resolved_root:
+            requested_root = str(project_link)
+
+    return resolve_dataset_identity(
+        dataset_format="fashioniq",
+        dress_types=dress_types,
+        dataset_root_requested=requested_root,
+        dataset_root_resolved=resolved_root,
+        output_dataset=output_dataset,
+    )

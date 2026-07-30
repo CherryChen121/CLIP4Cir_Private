@@ -5,6 +5,7 @@ import pytest
 from dataset_identity import (
     DatasetIdentityError,
     resolve_dataset_identity,
+    resolve_fashioniq_evaluation_identity,
     resolve_fashioniq_training_identity,
 )
 
@@ -141,6 +142,71 @@ def test_training_identity_rejects_categories_resolved_to_multiple_roots(
             dataset_root=None,
             output_dataset=None,
             root_resolver=lambda category, *_args: roots[category],
+        )
+
+
+def test_evaluation_identity_uses_requested_root_and_split(tmp_path):
+    root = tmp_path / "Combined_Fundus_CIR_Dataset"
+    root.mkdir()
+    calls = []
+
+    identity = resolve_fashioniq_evaluation_identity(
+        project_root=tmp_path,
+        dress_types=["ODIR5K", "GRAPE"],
+        split="test",
+        dataset_root=str(root),
+        output_dataset="combined-fundus-cir",
+        root_resolver=lambda category, split, requested: (
+            calls.append((category, split, requested)) or root
+        ),
+    )
+
+    assert calls == [
+        ("ODIR5K", "test", str(root)),
+        ("GRAPE", "test", str(root)),
+    ]
+    assert identity.dataset_slug == "combined-fundus-cir"
+    assert identity.root_requested == str(root)
+    assert identity.root_resolved == str(root.resolve())
+
+
+def test_evaluation_identity_classifies_actual_root_without_override(
+    tmp_path,
+):
+    root = tmp_path / "Combined_Fundus_CIR_Dataset"
+    root.mkdir()
+
+    identity = resolve_fashioniq_evaluation_identity(
+        project_root=tmp_path,
+        dress_types=["ODIR5K"],
+        split="test",
+        dataset_root=root,
+        output_dataset=None,
+        root_resolver=lambda *_args: root,
+    )
+
+    assert identity.dataset_slug == "combined-fundus-cir"
+    assert identity.dataset_format == "fashioniq"
+
+
+def test_evaluation_identity_rejects_categories_on_multiple_roots(
+    tmp_path,
+):
+    first = tmp_path / "IDRiD_CIR_Dataset_cold"
+    second = tmp_path / "UWF_CIR_Dataset_cold"
+    first.mkdir()
+    second.mkdir()
+
+    with pytest.raises(DatasetIdentityError, match="multiple dataset roots"):
+        resolve_fashioniq_evaluation_identity(
+            project_root=tmp_path,
+            dress_types=["IDRiD", "CH"],
+            split="val",
+            dataset_root=None,
+            output_dataset=None,
+            root_resolver=lambda category, *_args: (
+                first if category == "IDRiD" else second
+            ),
         )
 
 
