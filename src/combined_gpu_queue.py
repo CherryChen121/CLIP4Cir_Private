@@ -29,10 +29,15 @@ try:
         next_pending_task,
         parse_combined_queue,
         preflight_queue,
-        record_conflict,
         record_exit,
         record_interrupted,
         validate_resume_state,
+    )
+    from gpu_queue_audit import (
+        format_gpu_audit,
+        format_queue_pause,
+        format_task_end,
+        format_task_start,
     )
 except ImportError:
     from src.gpu_queue_core import (
@@ -48,10 +53,15 @@ except ImportError:
         next_pending_task,
         parse_combined_queue,
         preflight_queue,
-        record_conflict,
         record_exit,
         record_interrupted,
         validate_resume_state,
+    )
+    from src.gpu_queue_audit import (
+        format_gpu_audit,
+        format_queue_pause,
+        format_task_end,
+        format_task_start,
     )
 
 
@@ -287,6 +297,7 @@ class Dispatcher:
         self.owner_lookup = owner_lookup
         self.event_logger = event_logger
         self._task_specs = {task.task_id: task for task in queue.tasks}
+        self._completion_logged = False
 
     def _running_tasks(self):
         return [task for task in self.state["tasks"] if task["status"] == "running"]
@@ -303,6 +314,10 @@ class Dispatcher:
     def _save(self):
         self.state_store.save(self.state)
 
+    def _log_pause_if_new(self, was_paused: bool) -> None:
+        if not was_paused and self.state.get("paused_reason"):
+            self.event_logger(format_queue_pause(self.state["paused_reason"]))
+
     def _pause_probe_error(self, exc: Exception):
         if not self.state.get("paused_reason"):
             self.state["paused_reason"] = {
@@ -311,37 +326,25 @@ class Dispatcher:
                 "detected_at": self.now(),
             }
             self._save()
+            self.event_logger(format_queue_pause(self.state["paused_reason"]))
 
     def _poll_results(self):
         for task in list(self._running_tasks()):
             identity = self._identity(task)
+            was_paused = bool(self.state.get("paused_reason"))
             try:
                 return_code = self.launcher.poll(identity, Path(task["result_path"]))
             except ProcessIdentityError:
                 record_interrupted(self.state, task["task_id"], self.now())
                 self._save()
+                self.event_logger(format_task_end(task))
+                self._log_pause_if_new(was_paused)
                 continue
             if return_code is not None:
                 record_exit(self.state, task["task_id"], return_code, self.now())
                 self._save()
-
-    def _monitor_conflicts(self, snapshots: Tuple[GpuSnapshot, ...]):
-        by_index = {gpu.index: gpu for gpu in snapshots}
-        for task in list(self._running_tasks()):
-            gpu = by_index.get(task["gpu_index"])
-            if gpu is None or gpu.uuid != task["gpu_uuid"]:
-                record_interrupted(self.state, task["task_id"], self.now())
-                self._save()
-                continue
-            identity = self._identity(task)
-            owned_pids = self.proc_inspector.descendants(identity.pid) | {identity.pid}
-            unknown = sorted(set(gpu.compute_pids) - owned_pids)
-            if not unknown:
-                continue
-            owners = {pid: self.owner_lookup(pid) for pid in unknown}
-            record_conflict(self.state, task["task_id"], unknown, self.now(), owners)
-            self._save()
-            self.launcher.terminate(identity, grace_seconds=30)
+                self.event_logger(format_task_end(task))
+                self._log_pause_if_new(was_paused)
 
     @staticmethod
     def _gpu(snapshots: Tuple[GpuSnapshot, ...], index: int) -> Optional[GpuSnapshot]:
@@ -357,6 +360,36 @@ class Dispatcher:
             return None
         return second
 
+    def _audit_snapshots(self, snapshots: Tuple[GpuSnapshot, ...]) -> None:
+        running_by_gpu = {
+            int(task["gpu_index"]): task
+            for task in self._running_tasks()
+            if task.get("gpu_index") is not None
+        }
+        self.event_logger("GPU_AUDIT_BEGIN")
+        for snapshot in sorted(snapshots, key=lambda item: item.index):
+            task = running_by_gpu.get(snapshot.index)
+            owned_compute_pids = ()
+            if task is not None:
+                identity = self._identity(task)
+                owned_process_tree = self.proc_inspector.descendants(identity.pid) | {
+                    identity.pid
+                }
+                owned_compute_pids = tuple(
+                    sorted(set(snapshot.compute_pids) & owned_process_tree)
+                )
+            self.event_logger(
+                format_gpu_audit(
+                    snapshot,
+                    idle_now=self.idle_policy.is_idle_now(snapshot),
+                    idle_streak=self.idle_policy.idle_streak(snapshot.uuid),
+                    running_task=task,
+                    owned_compute_pids=owned_compute_pids,
+                    owner_lookup=self.owner_lookup,
+                )
+            )
+        self.event_logger("GPU_AUDIT_END")
+
     def run_cycle(self, sample_idle: bool) -> None:
         self._poll_results()
         try:
@@ -364,13 +397,16 @@ class Dispatcher:
         except ProbeError as exc:
             self._pause_probe_error(exc)
             return
-        self._monitor_conflicts(snapshots)
+        candidates = ()
+        if sample_idle and not self.state.get("paused_reason"):
+            try:
+                candidates = self.idle_policy.observe(snapshots)
+            except ProbeError as exc:
+                self._pause_probe_error(exc)
+                return
+        if sample_idle:
+            self._audit_snapshots(snapshots)
         if self.state.get("paused_reason") or not sample_idle:
-            return
-        try:
-            candidates = self.idle_policy.observe(snapshots)
-        except ProbeError as exc:
-            self._pause_probe_error(exc)
             return
         assigned = {task["gpu_index"] for task in self._running_tasks()}
         for index in candidates:
@@ -404,6 +440,7 @@ class Dispatcher:
                     "detected_at": self.now(),
                 }
                 self._save()
+                self.event_logger(format_queue_pause(self.state["paused_reason"]))
                 return
             mark_running(
                 self.state,
@@ -413,6 +450,7 @@ class Dispatcher:
                 self.now(),
             )
             self._save()
+            self.event_logger(format_task_start(pending))
             assigned.add(index)
 
     def reconcile_resume(self) -> None:
@@ -426,6 +464,9 @@ class Dispatcher:
             if self.state.get("paused_reason") and not running:
                 return 2
             if all(task["status"] == "succeeded" for task in self.state["tasks"]):
+                if not self._completion_logged:
+                    self.event_logger("QUEUE_COMPLETE")
+                    self._completion_logged = True
                 return 0
             cycle += 1
             self.sleeper(30)

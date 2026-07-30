@@ -258,6 +258,9 @@ class EligiblePolicy:
     def is_idle_now(self, snapshot):
         return not snapshot.compute_pids and snapshot.memory_used_mib <= 512 and snapshot.utilization_percent <= 5
 
+    def idle_streak(self, gpu_uuid):
+        return 5 if int(gpu_uuid.rsplit("-", 1)[1]) in self.eligible else 0
+
 
 class MemoryStore:
     def __init__(self):
@@ -307,6 +310,7 @@ def test_multiple_idle_gpus_receive_tasks_in_gpu_and_queue_order(tmp_path):
     state = initial_state(queue, "run-1", "created")
     launcher = DispatcherLauncher()
     sleeps = []
+    events = []
     dispatcher = Dispatcher(
         queue=queue,
         state=state,
@@ -317,13 +321,16 @@ def test_multiple_idle_gpus_receive_tasks_in_gpu_and_queue_order(tmp_path):
         proc_inspector=Descendants(),
         state_store=MemoryStore(),
         sleeper=sleeps.append,
-        now=lambda: "now",
+        now=lambda: "2026-07-30T10:00:00+0800",
+        event_logger=events.append,
     )
 
     dispatcher.run_cycle(sample_idle=True)
 
     assert launcher.assignments == [("A01", 2), ("A02", 5)]
     assert sleeps == [3, 3]
+    assert any(event.startswith("TASK_START task=A01 phase=A gpu=2") for event in events)
+    assert any(event.startswith("TASK_START task=A02 phase=A gpu=5") for event in events)
 
 
 def test_second_final_probe_becoming_busy_cancels_launch(tmp_path):
@@ -365,6 +372,7 @@ def test_launch_failure_pauses_queue_without_marking_task_running(tmp_path):
 
     queue = _queue()
     state = initial_state(queue, "run-1", "created")
+    events = []
     dispatcher = Dispatcher(
         queue=queue,
         state=state,
@@ -376,6 +384,7 @@ def test_launch_failure_pauses_queue_without_marking_task_running(tmp_path):
         state_store=MemoryStore(),
         sleeper=lambda seconds: None,
         now=lambda: "launch-time",
+        event_logger=events.append,
     )
 
     dispatcher.run_cycle(sample_idle=True)
@@ -387,12 +396,13 @@ def test_launch_failure_pauses_queue_without_marking_task_running(tmp_path):
         "detected_at": "launch-time",
     }
     assert next(task for task in state["tasks"] if task["task_id"] == "A01")["status"] == "pending"
+    assert events[-1].startswith("QUEUE_PAUSE kind=launch_error task=A01")
 
 
-def test_unknown_compute_pid_pauses_and_stops_only_owned_task(tmp_path):
+def test_foreign_pid_after_launch_is_logged_without_stopping_owned_task(tmp_path):
     queue = _queue()
     state = initial_state(queue, "run-1", "created")
-    gpu = GpuSnapshot(3, "GPU-3", 2000, 80, (101, 202, 7777))
+    gpu = GpuSnapshot(3, "GPU-3", 2000, 80, (202, 7777))
     launch = {
         "pid": 101,
         "pgid": 101,
@@ -404,6 +414,7 @@ def test_unknown_compute_pid_pauses_and_stops_only_owned_task(tmp_path):
     }
     mark_running(state, "A01", launch, gpu, "start")
     launcher = DispatcherLauncher()
+    events = []
     dispatcher = Dispatcher(
         queue=queue,
         state=state,
@@ -414,16 +425,73 @@ def test_unknown_compute_pid_pauses_and_stops_only_owned_task(tmp_path):
         proc_inspector=Descendants({101: {202}}),
         state_store=MemoryStore(),
         sleeper=lambda seconds: None,
-        now=lambda: "detected",
-        owner_lookup=lambda pid: "other-user",
+        now=lambda: "2026-07-30T10:00:00+0800",
+        owner_lookup=lambda pid: "xtchen",
+        event_logger=events.append,
+    )
+
+    dispatcher.run_cycle(sample_idle=True)
+
+    assert launcher.terminated == []
+    assert state["paused_reason"] is None
+    assert next(task for task in state["tasks"] if task["task_id"] == "A01")["status"] == "running"
+    assert any(
+        "GPU_AUDIT gpu=3" in event
+        and "status=SHARED" in event
+        and "foreign_pids=7777" in event
+        and "foreign_owners=xtchen" in event
+        for event in events
+    )
+
+
+def test_minute_cycle_logs_all_eight_gpus_once_in_index_order(tmp_path):
+    queue = _queue()
+    events = []
+    dispatcher = Dispatcher(
+        queue=queue,
+        state=initial_state(queue, "run-1", "created"),
+        run_dir=tmp_path,
+        probe=StaticProbe(_eight_snapshots()),
+        idle_policy=EligiblePolicy([]),
+        launcher=DispatcherLauncher(),
+        proc_inspector=Descendants(),
+        state_store=MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "2026-07-30T10:00:00+0800",
+        event_logger=events.append,
+    )
+
+    dispatcher.run_cycle(sample_idle=True)
+
+    audit_lines = [event for event in events if event.startswith("GPU_AUDIT gpu=")]
+    assert len(audit_lines) == 8
+    assert [line.split("gpu=", 1)[1].split(" ", 1)[0] for line in audit_lines] == [
+        str(index) for index in range(8)
+    ]
+    assert events.count("GPU_AUDIT_BEGIN") == 1
+    assert events.count("GPU_AUDIT_END") == 1
+
+
+def test_half_minute_cycle_does_not_log_gpu_audit(tmp_path):
+    queue = _queue()
+    events = []
+    dispatcher = Dispatcher(
+        queue=queue,
+        state=initial_state(queue, "run-1", "created"),
+        run_dir=tmp_path,
+        probe=StaticProbe(_eight_snapshots()),
+        idle_policy=EligiblePolicy([]),
+        launcher=DispatcherLauncher(),
+        proc_inspector=Descendants(),
+        state_store=MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "2026-07-30T10:00:30+0800",
+        event_logger=events.append,
     )
 
     dispatcher.run_cycle(sample_idle=False)
 
-    assert [identity.pid for identity in launcher.terminated] == [101]
-    assert state["paused_reason"]["kind"] == "foreign_gpu_process"
-    assert state["paused_reason"]["unknown_pids"] == [7777]
-    assert next(task for task in state["tasks"] if task["task_id"] == "A01")["status"] == "conflict_stopped"
+    assert not any(event.startswith("GPU_AUDIT") for event in events)
 
 
 def test_failed_task_pauses_but_other_owned_job_keeps_running(tmp_path):
@@ -452,6 +520,7 @@ def test_failed_task_pauses_but_other_owned_job_keeps_running(tmp_path):
             1: GpuSnapshot(1, "GPU-1", 100, 10, (102,)),
         }
     )
+    events = []
     dispatcher = Dispatcher(
         queue=queue,
         state=state,
@@ -462,7 +531,8 @@ def test_failed_task_pauses_but_other_owned_job_keeps_running(tmp_path):
         proc_inspector=Descendants(),
         state_store=MemoryStore(),
         sleeper=lambda seconds: None,
-        now=lambda: "end",
+        now=lambda: "2026-07-30T10:02:30+0800",
+        event_logger=events.append,
     )
 
     dispatcher.run_cycle(sample_idle=False)
@@ -470,6 +540,47 @@ def test_failed_task_pauses_but_other_owned_job_keeps_running(tmp_path):
     assert state["paused_reason"]["kind"] == "task_failed"
     assert next(task for task in state["tasks"] if task["task_id"] == "A02")["status"] == "running"
     assert launcher.terminated == []
+    assert any("TASK_END task=A01" in event and "result=FAILED" in event for event in events)
+    assert any(event.startswith("QUEUE_PAUSE kind=task_failed task=A01") for event in events)
+
+
+def test_successful_task_exit_logs_task_end(tmp_path):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    mark_running(
+        state,
+        "A01",
+        {
+            "pid": 101,
+            "pgid": 101,
+            "start_ticks": 10,
+            "command_sha256": "owned",
+            "manifest_path": str(tmp_path / "manifest.json"),
+            "result_path": str(tmp_path / "result.json"),
+            "log_path": str(tmp_path / "task.log"),
+        },
+        GpuSnapshot(0, "GPU-0", 100, 10, (101,)),
+        "2026-07-30T10:00:00+0800",
+    )
+    events = []
+    dispatcher = Dispatcher(
+        queue=queue,
+        state=state,
+        run_dir=tmp_path,
+        probe=StaticProbe(_eight_snapshots()),
+        idle_policy=EligiblePolicy([]),
+        launcher=DispatcherLauncher(exit_codes={101: 0}),
+        proc_inspector=Descendants(),
+        state_store=MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "2026-07-30T10:02:30+0800",
+        event_logger=events.append,
+    )
+
+    dispatcher.run_cycle(sample_idle=False)
+
+    assert any("TASK_END task=A01" in event and "result=SUCCEEDED" in event for event in events)
+    assert state["paused_reason"] is None
 
 
 def test_resume_keeps_exact_live_worker_running(tmp_path):
@@ -524,16 +635,49 @@ def test_resume_marks_missing_worker_interrupted_and_pauses(tmp_path):
         GpuSnapshot(0, "GPU-0", 100, 10, (101,)),
         "start",
     )
+    events = []
     dispatcher = Dispatcher(
         queue, state, tmp_path, StaticProbe(_eight_snapshots()),
         EligiblePolicy([]), MissingLauncher(), Descendants(), MemoryStore(),
-        sleeper=lambda seconds: None, now=lambda: "resume",
+        sleeper=lambda seconds: None,
+        now=lambda: "2026-07-30T10:02:30+0800",
+        event_logger=events.append,
     )
 
     dispatcher.reconcile_resume()
 
     assert next(task for task in state["tasks"] if task["task_id"] == "A01")["status"] == "interrupted"
     assert state["paused_reason"]["kind"] == "process_identity_unverified"
+    assert any("TASK_END task=A01" in event and "result=INTERRUPTED" in event for event in events)
+    assert any(
+        event.startswith("QUEUE_PAUSE kind=process_identity_unverified task=A01")
+        for event in events
+    )
+
+
+def test_completed_queue_logs_completion_once(tmp_path):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    for task in state["tasks"]:
+        task["status"] = "succeeded"
+    events = []
+    dispatcher = Dispatcher(
+        queue=queue,
+        state=state,
+        run_dir=tmp_path,
+        probe=StaticProbe(_eight_snapshots()),
+        idle_policy=EligiblePolicy([]),
+        launcher=DispatcherLauncher(),
+        proc_inspector=Descendants(),
+        state_store=MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "2026-07-30T10:02:30+0800",
+        event_logger=events.append,
+    )
+
+    assert dispatcher.run_forever() == 0
+
+    assert events.count("QUEUE_COMPLETE") == 1
 
 
 def test_cli_requires_exactly_one_mode():
