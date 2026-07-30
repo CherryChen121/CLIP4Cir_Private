@@ -93,6 +93,10 @@ class AlreadyRunningError(RuntimeError):
     pass
 
 
+class LaunchCleanupError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class ProcessIdentity:
     pid: int
@@ -206,6 +210,16 @@ class OwnedProcessLauncher:
         self.sleeper = sleeper
         self.monotonic = monotonic
 
+    def _terminate_unverified_launch(self, pid: int) -> None:
+        try:
+            self.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError as exc:
+            raise LaunchCleanupError(
+                f"cannot terminate unverified worker process group {pid}: {exc}"
+            ) from exc
+
     def start(self, task: TaskSpec, gpu: GpuSnapshot, task_dir: Path) -> LaunchRecord:
         task_dir = Path(task_dir)
         task_dir.mkdir(parents=True, exist_ok=False)
@@ -243,8 +257,13 @@ class OwnedProcessLauncher:
             shell=False,
             start_new_session=True,
         )
-        identity = self.proc_inspector.identity(process.pid)
+        try:
+            identity = self.proc_inspector.identity(process.pid)
+        except ProcessIdentityError:
+            self._terminate_unverified_launch(process.pid)
+            raise
         if identity is None:
+            self._terminate_unverified_launch(process.pid)
             raise ProcessIdentityError(f"worker PID {process.pid} disappeared during launch")
         return LaunchRecord(identity, manifest_path, result_path, log_path)
 
@@ -324,6 +343,7 @@ class Dispatcher:
         self.event_logger = event_logger
         self._task_specs = {task.task_id: task for task in queue.tasks}
         self._completion_logged = False
+        self._disqualified_indices = set()
 
     def _running_tasks(self):
         return [task for task in self.state["tasks"] if task["status"] == "running"]
@@ -401,11 +421,15 @@ class Dispatcher:
             return "utilization_above_limit"
         return None
 
-    def _release(self, lease: dict, reason: str, *, save: bool = True) -> None:
-        released = release_lease(self.state, int(lease["gpu_index"]))
+    def _disqualify(self, gpu_index: int, gpu_uuid: str) -> None:
         reset = getattr(self.idle_policy, "reset", None)
         if reset is not None:
-            reset(released["gpu_uuid"])
+            reset(gpu_uuid)
+        self._disqualified_indices.add(int(gpu_index))
+
+    def _release(self, lease: dict, reason: str, *, save: bool = True) -> None:
+        released = release_lease(self.state, int(lease["gpu_index"]))
+        self._disqualify(released["gpu_index"], released["gpu_uuid"])
         if save:
             self._save()
         self.event_logger(
@@ -442,6 +466,18 @@ class Dispatcher:
                 lease = lease_for_gpu(self.state, gpu.index)
                 if lease is not None:
                     self._release(lease, "launch_failed", save=False)
+            else:
+                self._disqualify(gpu.index, gpu.uuid)
+                self.event_logger(
+                    format_lease_event(
+                        "GPU_LEASE_RELEASED",
+                        {
+                            "gpu_index": gpu.index,
+                            "gpu_uuid": gpu.uuid,
+                        },
+                        reason="launch_failed",
+                    )
+                )
             self._save()
             self.event_logger(format_task_end(pending))
             return False
@@ -541,7 +577,23 @@ class Dispatcher:
             )
         self.event_logger("GPU_AUDIT_END")
 
+    def _validate_running_lease_mapping(
+        self,
+        snapshots: Tuple[GpuSnapshot, ...],
+    ) -> None:
+        for lease in self.state.get("leases", []):
+            if lease.get("state") != "running":
+                continue
+            snapshot = self._gpu(snapshots, int(lease["gpu_index"]))
+            if snapshot is None or snapshot.uuid != lease["gpu_uuid"]:
+                found = snapshot.uuid if snapshot is not None else "missing"
+                raise GpuMappingError(
+                    f"running lease GPU mapping changed for index "
+                    f"{lease['gpu_index']}: expected {lease['gpu_uuid']}, found {found}"
+                )
+
     def run_cycle(self, sample_idle: bool) -> None:
+        self._disqualified_indices = set()
         self._poll_results()
         try:
             snapshots = self.probe.snapshot()
@@ -550,6 +602,7 @@ class Dispatcher:
         except ProbeError as exc:
             self._log_probe_error(exc)
             return
+        self._validate_running_lease_mapping(snapshots)
         candidates = ()
         if sample_idle and not self.state.get("paused_reason"):
             try:
@@ -578,7 +631,7 @@ class Dispatcher:
         for index in candidates:
             if len(self.state.get("leases", [])) >= self.max_gpu_leases:
                 break
-            if index in leased:
+            if index in leased or index in self._disqualified_indices:
                 continue
             pending = next_pending_task(self.state)
             if pending is None:
@@ -594,6 +647,7 @@ class Dispatcher:
                 self._log_probe_error(exc)
                 return
             if final_gpu is None:
+                self._disqualify(index, initial_gpu.uuid)
                 continue
             self._dispatch_on_gpu(pending, final_gpu, reuse=False)
             if lease_for_gpu(self.state, index) is not None:
@@ -860,6 +914,6 @@ class NvidiaSmiProbe:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (AlreadyRunningError, ProbeError, ResumeError) as exc:
+    except (AlreadyRunningError, LaunchCleanupError, ProbeError, ResumeError) as exc:
         print(f"dispatcher error: {exc}")
         raise SystemExit(2)

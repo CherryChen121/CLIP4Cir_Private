@@ -402,6 +402,40 @@ def test_resume_requires_running_tasks_and_leases_to_match():
         validate_resume_state(state, _small_queue())
 
 
+def test_resume_rejects_running_task_and_lease_gpu_identity_mismatch():
+    state = initial_state(_small_queue(), "run-1", "created")
+    gpu = GpuSnapshot(0, "GPU-0", 0, 0, ())
+    mark_running(state, "A01", _launch(), gpu, "start")
+    acquire_lease(state, GpuSnapshot(1, "GPU-1", 0, 0, ()), "A01", "acquired")
+
+    with pytest.raises(ResumeError, match="GPU identity"):
+        validate_resume_state(state, _small_queue())
+
+
+def test_resume_rejects_unknown_task_status_and_out_of_range_gpu():
+    state = initial_state(_small_queue(), "run-1", "created")
+    state["tasks"][0]["status"] = "mystery"
+
+    with pytest.raises(ResumeError, match="invalid task status"):
+        validate_resume_state(state, _small_queue())
+
+    state["tasks"][0]["status"] = "pending"
+    state["leases"].append(
+        {
+            "gpu_index": 8,
+            "gpu_uuid": "GPU-8",
+            "state": "cooldown",
+            "task_id": None,
+            "previous_task_id": "A01",
+            "cooldown_ready_at": 60.0,
+            "acquired_at": "acquired",
+            "updated_at": "updated",
+        }
+    )
+    with pytest.raises(ResumeError, match="GPU index"):
+        validate_resume_state(state, _small_queue())
+
+
 def test_terminal_summary_reports_partial_success_task_ids():
     state = initial_state(_small_queue(), "run-1", "created")
     statuses = ("succeeded", "failed", "launch_failed", "interrupted")

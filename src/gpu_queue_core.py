@@ -396,6 +396,14 @@ def validate_lease_state(state: dict) -> None:
     if len(leases) > MAX_GPU_LEASES:
         raise ResumeError(f"state may hold at most {MAX_GPU_LEASES} GPU leases")
 
+    allowed_task_statuses = {"pending", "running"} | TERMINAL_STATUSES
+    tasks = state.get("tasks", [])
+    for task in tasks:
+        if task.get("status") not in allowed_task_statuses:
+            raise ResumeError(
+                f"invalid task status for {task.get('task_id')}: {task.get('status')}"
+            )
+
     indices = [lease.get("gpu_index") for lease in leases]
     if len(set(indices)) != len(indices):
         raise ResumeError("duplicate GPU index in leases")
@@ -416,6 +424,8 @@ def validate_lease_state(state: dict) -> None:
             raise ResumeError(f"invalid lease state: {lease_state}")
         if not isinstance(lease.get("gpu_index"), int):
             raise ResumeError("lease gpu_index must be an integer")
+        if lease["gpu_index"] not in range(8):
+            raise ResumeError(f"lease GPU index is out of range: {lease['gpu_index']}")
         if not isinstance(lease.get("gpu_uuid"), str) or not lease["gpu_uuid"]:
             raise ResumeError("lease gpu_uuid must be non-empty")
         ready_at = lease.get("cooldown_ready_at")
@@ -434,7 +444,7 @@ def validate_lease_state(state: dict) -> None:
 
     running_tasks = {
         task["task_id"]
-        for task in state.get("tasks", [])
+        for task in tasks
         if task.get("status") == "running"
     }
     running_leases = {
@@ -442,6 +452,27 @@ def validate_lease_state(state: dict) -> None:
     }
     if running_tasks != running_leases:
         raise ResumeError("running task and running lease associations do not match")
+    tasks_by_id = {task["task_id"]: task for task in tasks}
+    for lease in leases:
+        if lease["state"] == "running":
+            task = tasks_by_id[lease["task_id"]]
+            if (
+                task.get("gpu_index") != lease["gpu_index"]
+                or task.get("gpu_uuid") != lease["gpu_uuid"]
+            ):
+                raise ResumeError(
+                    f"running task {task['task_id']} GPU identity does not match lease"
+                )
+        else:
+            previous_task_id = lease.get("previous_task_id")
+            previous_task = tasks_by_id.get(previous_task_id)
+            if (
+                previous_task is None
+                or previous_task.get("status") not in TERMINAL_STATUSES
+            ):
+                raise ResumeError(
+                    "cooldown lease previous task is missing or not terminal"
+                )
 
 
 def initial_state(

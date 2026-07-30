@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -196,6 +197,28 @@ def test_launcher_uses_worker_new_session_and_persists_only_safe_env(tmp_path):
         "NCCL_P2P_DISABLE": "1",
     }
     assert "PATH" not in manifest["env_overrides"]
+
+
+def test_launcher_terminates_new_process_group_if_identity_is_unverified(tmp_path):
+    popen = FakePopen()
+    signals = []
+    launcher = OwnedProcessLauncher(
+        project_root=tmp_path,
+        python_executable=Path(sys.executable),
+        worker_script=tmp_path / "gpu_queue_worker.py",
+        proc_inspector=FakeInspector(None),
+        popen_factory=popen,
+        killpg=lambda pgid, signal_number: signals.append((pgid, signal_number)),
+    )
+
+    with pytest.raises(ProcessIdentityError, match="disappeared during launch"):
+        launcher.start(
+            _task(),
+            GpuSnapshot(6, "GPU-6", 0, 0, ()),
+            tmp_path / "A01",
+        )
+
+    assert signals == [(4321, signal.SIGTERM)]
 
 
 def test_terminate_refuses_signal_when_process_identity_changed(tmp_path):
@@ -546,6 +569,94 @@ def test_second_final_probe_becoming_busy_cancels_launch(tmp_path):
     assert launcher.assignments == []
 
 
+def test_failed_final_check_resets_five_sample_qualification(tmp_path):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    idle = _eight_snapshots(
+        {
+            index: GpuSnapshot(index, f"GPU-{index}", 0, 0, (9000 + index,))
+            for index in range(8)
+            if index != 2
+        }
+    )
+    busy_final = _eight_snapshots(
+        {2: GpuSnapshot(2, "GPU-2", 0, 0, (7777,))}
+    )
+    policy = IdlePolicy(expected_indices=range(8))
+    for _ in range(4):
+        policy.observe(idle)
+
+    class SequencedProbe:
+        def __init__(self):
+            self.responses = iter((idle, idle, busy_final))
+
+        def snapshot(self):
+            return next(self.responses)
+
+    dispatcher = Dispatcher(
+        queue,
+        state,
+        tmp_path,
+        SequencedProbe(),
+        policy,
+        DispatcherLauncher(),
+        Descendants(),
+        MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "now",
+    )
+
+    dispatcher.run_cycle(sample_idle=True)
+
+    assert policy.idle_streak("GPU-2") == 0
+
+
+def test_released_cooldown_gpu_cannot_reenter_from_stale_candidate_same_cycle(
+    tmp_path,
+):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    _seed_running(state, "A01", 2, 101, tmp_path)
+    state["tasks"][0]["status"] = "succeeded"
+    state["leases"][0].update(
+        state="cooldown",
+        task_id=None,
+        previous_task_id="A01",
+        cooldown_ready_at=100.0,
+    )
+    idle = _eight_snapshots()
+    busy = _eight_snapshots(
+        {2: GpuSnapshot(2, "GPU-2", 0, 0, (7777,))}
+    )
+
+    class SequencedProbe:
+        def __init__(self):
+            self.responses = iter((idle, busy, idle, idle))
+
+        def snapshot(self):
+            return next(self.responses)
+
+    launcher = DispatcherLauncher()
+    dispatcher = Dispatcher(
+        queue,
+        state,
+        tmp_path,
+        SequencedProbe(),
+        EligiblePolicy([2]),
+        launcher,
+        Descendants(),
+        MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "now",
+        clock=lambda: 100.0,
+    )
+
+    dispatcher.run_cycle(sample_idle=True)
+
+    assert launcher.assignments == []
+    assert state["leases"] == []
+
+
 def test_launch_failure_is_terminal_and_does_not_pause_queue(tmp_path):
     class FailingLauncher(DispatcherLauncher):
         def start(self, task, gpu, task_dir):
@@ -577,6 +688,11 @@ def test_launch_failure_is_terminal_and_does_not_pause_queue(tmp_path):
     assert task["gpu_index"] == 2
     assert state["leases"] == []
     assert any("TASK_END task=A01" in event and "LAUNCH_FAILED" in event for event in events)
+    assert any(
+        event.startswith("GPU_LEASE_RELEASED gpu=2")
+        and event.endswith("reason=launch_failed")
+        for event in events
+    )
 
 
 def test_launch_failure_does_not_block_next_candidate(tmp_path):
@@ -675,6 +791,30 @@ def test_fatal_gpu_mapping_change_is_not_treated_as_transient(tmp_path):
         dispatcher.run_cycle(sample_idle=True)
     assert events == []
     assert state["leases"] == []
+
+
+def test_running_lease_uuid_mismatch_fails_closed_after_resume(tmp_path):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    _seed_running(state, "A01", 0, 101, tmp_path)
+    snapshots = _eight_snapshots(
+        {0: GpuSnapshot(0, "GPU-replaced", 100, 10, (101,))}
+    )
+    dispatcher = Dispatcher(
+        queue,
+        state,
+        tmp_path,
+        StaticProbe(snapshots),
+        EligiblePolicy([]),
+        DispatcherLauncher(),
+        Descendants(),
+        MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "now",
+    )
+
+    with pytest.raises(GpuMappingError, match="running lease"):
+        dispatcher.run_cycle(sample_idle=False)
 
 
 def test_mixed_phase_a_terminal_results_allow_phase_b_dispatch(tmp_path):
