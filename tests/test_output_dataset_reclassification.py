@@ -3,6 +3,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -13,6 +15,7 @@ from output_dataset_reclassification import (
     apply_reclassification,
     build_reclassification_plan,
     classify_run,
+    finalize_reclassification,
     find_output_writer_pids,
     verify_reclassification,
 )
@@ -80,7 +83,7 @@ AUDIT_FIELDS = (
 )
 
 
-def write_audit_fixture(output_root: Path, runs) -> None:
+def write_audit_fixture(output_root: Path, runs, reports=()) -> None:
     rows = []
     for run in runs:
         stage, model_slug, run_id = run.relative_to(
@@ -110,6 +113,25 @@ def write_audit_fixture(output_root: Path, runs) -> None:
                     "reason": "",
                 }
             )
+    for report in reports:
+        rows.append(
+            {
+                "old_path": str(
+                    output_root.parent / "models" / report.name
+                ),
+                "new_path": str(report),
+                "dataset": "",
+                "stage": "",
+                "model_slug": "",
+                "run_id": "",
+                "status": "moved",
+                "size": str(report.stat().st_size),
+                "sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+                "duplicate_group": "",
+                "canonical": "",
+                "reason": "",
+            }
+        )
     with (output_root / "migration_manifest.csv").open(
         "w", newline="", encoding="utf-8"
     ) as file:
@@ -126,6 +148,43 @@ def write_audit_fixture(output_root: Path, runs) -> None:
         )
         + "\n",
         encoding="utf-8",
+    )
+
+
+def make_five_legacy_reports(output_root: Path):
+    relative_paths = (
+        "clip-finetuned-vit-b/validation.xlsx",
+        "clip-finetuned-vit-l/summary.xlsx",
+        "combiner-vit-b/validation.xlsx",
+        "combiner-vit-l/validation.xlsx",
+        "standalone.xlsx",
+    )
+    reports = []
+    for index, relative in enumerate(relative_paths):
+        report = output_root / "reports/legacy" / relative
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_bytes(f"report-{index}".encode())
+        reports.append(report)
+    return tuple(reports)
+
+
+def run_reclassification_cli(output_root: Path, *arguments):
+    project_root = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(project_root / "src")
+    return subprocess.run(
+        [
+            sys.executable,
+            str(project_root / "scripts/reclassify_output_datasets.py"),
+            "--output-root",
+            str(output_root),
+            *arguments,
+        ],
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
 
 
@@ -591,3 +650,187 @@ def test_find_output_writer_pids_filters_cirr_and_other_output_roots(tmp_path):
         (process / "cwd").symlink_to(project, target_is_directory=True)
 
     assert find_output_writer_pids(project, output, proc_root=proc) == (101,)
+
+
+def test_cli_defaults_to_read_only_dry_run(tmp_path):
+    run = make_run(
+        tmp_path,
+        "clip-finetune",
+        "dry",
+        validation_headers=("IDRiD_recall_at1",),
+    )
+    write_audit_fixture(tmp_path, [run])
+    before = sorted(
+        str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")
+    )
+
+    result = run_reclassification_cli(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["mode"] == "dry-run"
+    assert payload["total_runs"] == 1
+    assert payload["dataset_counts"] == {"idrid": 1}
+    assert payload["unresolved"] == 0
+    assert payload["collisions"] == 0
+    after = sorted(
+        str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")
+    )
+    assert before == after
+
+
+def test_cli_rejects_multiple_mutating_modes(tmp_path):
+    result = run_reclassification_cli(
+        tmp_path, "--apply", "--finalize"
+    )
+
+    assert result.returncode != 0
+    assert "not allowed with argument" in result.stderr
+
+
+def test_cli_apply_verify_finalize_lifecycle(tmp_path):
+    run = make_run(
+        tmp_path,
+        "combiner",
+        "lifecycle",
+        hyperparameters={"train_dress_types": ["IDRiD"]},
+        validation_headers=("IDRiD_recall_at1",),
+    )
+    reports = make_five_legacy_reports(tmp_path)
+    write_audit_fixture(tmp_path, [run], reports)
+
+    applied = run_reclassification_cli(tmp_path, "--apply")
+    verified = run_reclassification_cli(tmp_path, "--verify")
+    finalized = run_reclassification_cli(tmp_path, "--finalize")
+    final_verification = run_reclassification_cli(tmp_path, "--verify")
+
+    assert applied.returncode == 0, applied.stderr
+    assert json.loads(applied.stdout)["mode"] == "apply"
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["ok"] is True
+    assert finalized.returncode == 0, finalized.stderr
+    assert json.loads(finalized.stdout)["mode"] == "finalize"
+    assert final_verification.returncode == 0, final_verification.stderr
+    assert json.loads(final_verification.stdout)["ok"] is True
+
+
+def test_finalize_deletes_only_five_audited_reports_and_empty_trees(
+    tmp_path,
+):
+    run = make_run(
+        tmp_path,
+        "combiner",
+        "idrid",
+        hyperparameters={"train_dress_types": ["IDRiD"]},
+        validation_headers=("IDRiD_recall_at1",),
+    )
+    reports = make_five_legacy_reports(tmp_path)
+    write_audit_fixture(tmp_path, [run], reports)
+    plan = build_reclassification_plan(tmp_path)
+    apply_reclassification(plan)
+
+    result = finalize_reclassification(tmp_path)
+
+    assert result.ok
+    assert result.run_counts == {"idrid": 1}
+    assert not (tmp_path / "reports").exists()
+    assert not (tmp_path / "fashioniq").exists()
+    assert not (tmp_path / ".dataset-reclassify-staging").exists()
+    rows = list(
+        csv.DictReader(
+            (tmp_path / "migration_manifest.csv").open(encoding="utf-8")
+        )
+    )
+    deleted = [
+        row
+        for row in rows
+        if row["status"] == "deleted-approved-report"
+    ]
+    assert len(deleted) == 5
+    assert {row["reason"] for row in deleted} == {
+        "user-approved-obsolete-legacy-summary"
+    }
+    report = json.loads(
+        (tmp_path / "migration_report.json").read_text(encoding="utf-8")
+    )
+    assert report["reclassification_state"] == "finalized"
+    assert report["status_counts"]["deleted-approved-report"] == 5
+
+
+def test_finalize_blocks_unplanned_report_without_deleting_anything(
+    tmp_path,
+):
+    run = make_run(
+        tmp_path,
+        "combiner",
+        "idrid",
+        hyperparameters={"train_dress_types": ["IDRiD"]},
+        validation_headers=("IDRiD_recall_at1",),
+    )
+    reports = make_five_legacy_reports(tmp_path)
+    write_audit_fixture(tmp_path, [run], reports)
+    plan = build_reclassification_plan(tmp_path)
+    apply_reclassification(plan)
+    extra = tmp_path / "reports/legacy/unplanned.xlsx"
+    extra.write_bytes(b"must survive")
+
+    with pytest.raises(
+        ReclassificationBlockedError, match="unplanned report"
+    ):
+        finalize_reclassification(tmp_path)
+
+    assert all(report.exists() for report in reports)
+    assert extra.exists()
+    rows = list(
+        csv.DictReader(
+            (tmp_path / "migration_manifest.csv").open(encoding="utf-8")
+        )
+    )
+    assert not any(
+        row["status"] == "deleted-approved-report" for row in rows
+    )
+
+
+def test_finalize_restores_reports_when_audit_update_fails(
+    tmp_path, monkeypatch
+):
+    run = make_run(
+        tmp_path,
+        "combiner",
+        "idrid",
+        hyperparameters={"train_dress_types": ["IDRiD"]},
+        validation_headers=("IDRiD_recall_at1",),
+    )
+    reports = make_five_legacy_reports(tmp_path)
+    write_audit_fixture(tmp_path, [run], reports)
+    plan = build_reclassification_plan(tmp_path)
+    apply_reclassification(plan)
+    original_audit = (tmp_path / "migration_manifest.csv").read_bytes()
+    module = __import__("output_dataset_reclassification")
+    real_replace_file = module._replace_file
+    failure_injected = False
+
+    def fail_finalized_manifest_once(source, destination):
+        nonlocal failure_injected
+        if (
+            destination.name == "migration_manifest.csv"
+            and not failure_injected
+        ):
+            failure_injected = True
+            raise OSError("injected finalize audit failure")
+        return real_replace_file(source, destination)
+
+    monkeypatch.setattr(
+        module, "_replace_file", fail_finalized_manifest_once
+    )
+
+    with pytest.raises(TransactionError, match="finalize rolled back"):
+        finalize_reclassification(tmp_path)
+
+    assert all(report.exists() for report in reports)
+    assert (
+        tmp_path / "migration_manifest.csv"
+    ).read_bytes() == original_audit
+    assert (
+        tmp_path / ".dataset-reclassify-staging"
+    ).exists()

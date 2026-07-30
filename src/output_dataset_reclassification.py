@@ -1019,3 +1019,332 @@ def verify_reclassification(
         retained_audit_files=retained_audit_files,
         errors=tuple(errors),
     )
+
+
+APPROVED_REPORT_STATUS = "deleted-approved-report"
+APPROVED_REPORT_REASON = "user-approved-obsolete-legacy-summary"
+
+
+def _read_audit_rows(
+    output_root: Path,
+) -> Tuple[List[str], List[dict]]:
+    manifest_path = output_root / "migration_manifest.csv"
+    with manifest_path.open(encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+    if not fieldnames:
+        raise ReclassificationBlockedError(
+            f"migration manifest has no header: {manifest_path}"
+        )
+    return list(fieldnames), rows
+
+
+def _approved_report_rows(
+    output_root: Path, rows: Sequence[dict]
+) -> Tuple[Tuple[dict, Path], ...]:
+    legacy_root = (output_root / "reports" / "legacy").resolve()
+    selected = []
+    for row in rows:
+        raw_path = row.get("new_path", "")
+        if (
+            row.get("status") != "moved"
+            or not raw_path.lower().endswith(".xlsx")
+        ):
+            continue
+        path = Path(raw_path)
+        try:
+            path.resolve().relative_to(legacy_root)
+        except ValueError:
+            continue
+        selected.append((row, path))
+    if len(selected) != 5:
+        raise ReclassificationBlockedError(
+            "expected exactly 5 approved legacy reports, found "
+            f"{len(selected)}"
+        )
+    return tuple(selected)
+
+
+def _verify_approved_report_set(
+    output_root: Path,
+    selected: Sequence[Tuple[dict, Path]],
+) -> None:
+    legacy_root = output_root / "reports" / "legacy"
+    expected = {path.resolve() for _row, path in selected}
+    actual = set()
+    if legacy_root.exists():
+        for path in legacy_root.rglob("*"):
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                raise ReclassificationBlockedError(
+                    f"symlink in legacy reports is not allowed: {path}"
+                )
+            if stat.S_ISREG(mode):
+                actual.add(path.resolve())
+            elif not stat.S_ISDIR(mode):
+                raise ReclassificationBlockedError(
+                    f"special file in legacy reports is not allowed: {path}"
+                )
+    unexpected = actual - expected
+    missing = expected - actual
+    if unexpected:
+        raise ReclassificationBlockedError(
+            "unplanned report files block finalize: "
+            + ", ".join(str(path) for path in sorted(unexpected))
+        )
+    if missing:
+        raise ReclassificationBlockedError(
+            "approved report files are missing: "
+            + ", ".join(str(path) for path in sorted(missing))
+        )
+    for row, path in selected:
+        if path.stat().st_size != int(row["size"]):
+            raise ReclassificationBlockedError(
+                f"approved report size mismatch: {path}"
+            )
+        if sha256_file(path) != row["sha256"]:
+            raise ReclassificationBlockedError(
+                f"approved report sha256 mismatch: {path}"
+            )
+
+
+def _assert_tree_contains_only_directories(path: Path) -> None:
+    if not path.exists():
+        return
+    for descendant in path.rglob("*"):
+        mode = descendant.lstat().st_mode
+        if not stat.S_ISDIR(mode):
+            raise ReclassificationBlockedError(
+                f"cleanup tree is not empty: {descendant}"
+            )
+
+
+def _write_finalized_audits(
+    output_root: Path,
+    fieldnames: Sequence[str],
+    rows: Sequence[dict],
+    deleted_count: int,
+) -> None:
+    csv_path = output_root / "migration_manifest.csv"
+    temporary = csv_path.with_name(
+        f".{csv_path.name}.dataset-reclassify.tmp"
+    )
+    with temporary.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        file.flush()
+        os.fsync(file.fileno())
+    _replace_file(temporary, csv_path)
+
+    report_path = output_root / "migration_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    status_counts = dict(report.get("status_counts", {}))
+    moved_count = int(status_counts.get("moved", 0)) - deleted_count
+    if moved_count < 0:
+        raise ReclassificationBlockedError(
+            "migration report moved count is smaller than report deletions"
+        )
+    if moved_count:
+        status_counts["moved"] = moved_count
+    else:
+        status_counts.pop("moved", None)
+    status_counts[APPROVED_REPORT_STATUS] = (
+        int(status_counts.get(APPROVED_REPORT_STATUS, 0))
+        + deleted_count
+    )
+    report["status_counts"] = dict(sorted(status_counts.items()))
+    report["reclassification_state"] = "finalized"
+    _write_json_atomic(report_path, report)
+
+
+def _restore_finalize_state(
+    audit_backups: Sequence[Tuple[Path, Path]],
+    quarantined: Sequence[Tuple[Path, Path]],
+) -> Tuple[str, ...]:
+    errors = list(_restore_metadata(audit_backups))
+    for original, quarantine in reversed(tuple(quarantined)):
+        try:
+            if quarantine.exists():
+                original.parent.mkdir(parents=True, exist_ok=True)
+                quarantine.replace(original)
+        except OSError as error:
+            errors.append(f"{original}: {error}")
+    return tuple(errors)
+
+
+def _remove_empty_tree(path: Path) -> None:
+    if not path.exists():
+        return
+    for directory in sorted(
+        (
+            descendant
+            for descendant in path.rglob("*")
+            if descendant.is_dir() and not descendant.is_symlink()
+        ),
+        key=lambda descendant: len(descendant.parts),
+        reverse=True,
+    ):
+        directory.rmdir()
+    path.rmdir()
+
+
+def _transaction_artifact_files(
+    staging_root: Path,
+    quarantined: Sequence[Tuple[Path, Path]],
+    finalize_backups: Sequence[Tuple[Path, Path]],
+) -> Tuple[Path, ...]:
+    journal_path = staging_root / "transaction.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    action_count = len(journal.get("actions", ()))
+    expected = {
+        journal_path,
+        staging_root / "metadata-backup/migration_manifest.csv",
+        staging_root / "metadata-backup/migration_report.json",
+    }
+    expected.update(
+        staging_root
+        / "metadata-backup/run-manifests"
+        / f"{index:04d}.json"
+        for index in range(action_count)
+    )
+    expected.update(
+        quarantine for _original, quarantine in quarantined
+    )
+    expected.update(backup for backup, _target in finalize_backups)
+    actual = {
+        path
+        for path in staging_root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    if actual != expected:
+        unexpected = actual - expected
+        missing = expected - actual
+        raise ReclassificationBlockedError(
+            "unexpected transaction artifacts; unexpected="
+            + repr(sorted(str(path) for path in unexpected))
+            + "; missing="
+            + repr(sorted(str(path) for path in missing))
+        )
+    for path in staging_root.rglob("*"):
+        if path.is_symlink():
+            raise ReclassificationBlockedError(
+                f"symlink in transaction staging is not allowed: {path}"
+            )
+    return tuple(sorted(expected))
+
+
+def finalize_reclassification(
+    output_root: Path,
+    *,
+    expected_plan: Optional[ReclassificationPlan] = None,
+) -> VerificationResult:
+    output_root = Path(output_root).resolve()
+    applied_verification = verify_reclassification(
+        output_root,
+        expected_plan=expected_plan,
+        finalized=False,
+    )
+    if not applied_verification.ok:
+        raise ReclassificationBlockedError(
+            "applied-state verification failed: "
+            + "; ".join(applied_verification.errors)
+        )
+
+    fieldnames, rows = _read_audit_rows(output_root)
+    selected = _approved_report_rows(output_root, rows)
+    _verify_approved_report_set(output_root, selected)
+    _assert_tree_contains_only_directories(output_root / "fashioniq")
+
+    staging_root = output_root / ".dataset-reclassify-staging"
+    journal_path = staging_root / "transaction.json"
+    if not journal_path.is_file():
+        raise ReclassificationBlockedError(
+            f"applied transaction journal is missing: {journal_path}"
+        )
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    if journal.get("state") != "applied":
+        raise ReclassificationBlockedError(
+            f"transaction is not in applied state: {journal_path}"
+        )
+
+    finalize_backup_root = staging_root / "finalize-backup"
+    if finalize_backup_root.exists():
+        raise ReclassificationBlockedError(
+            f"finalize backup already exists: {finalize_backup_root}"
+        )
+    finalize_backup_root.mkdir()
+    audit_backups = []
+    for name in ("migration_manifest.csv", "migration_report.json"):
+        target = output_root / name
+        backup = finalize_backup_root / name
+        backup.write_bytes(target.read_bytes())
+        audit_backups.append((backup, target))
+
+    legacy_root = output_root / "reports" / "legacy"
+    quarantine_root = staging_root / "approved-report-deletions"
+    quarantined = []
+    try:
+        for row, original in selected:
+            relative = original.resolve().relative_to(
+                legacy_root.resolve()
+            )
+            quarantine = quarantine_root / relative
+            quarantine.parent.mkdir(parents=True, exist_ok=True)
+            original.replace(quarantine)
+            quarantined.append((original, quarantine))
+            row["status"] = APPROVED_REPORT_STATUS
+            row["reason"] = APPROVED_REPORT_REASON
+
+        _write_finalized_audits(
+            output_root, fieldnames, rows, len(selected)
+        )
+        intermediate = verify_reclassification(
+            output_root,
+            expected_plan=expected_plan,
+            finalized=False,
+        )
+        if not intermediate.ok:
+            raise TransactionError(
+                "finalized audit verification failed: "
+                + "; ".join(intermediate.errors)
+            )
+        exact_artifacts = _transaction_artifact_files(
+            staging_root, quarantined, audit_backups
+        )
+    except Exception as error:
+        restore_errors = _restore_finalize_state(
+            audit_backups, quarantined
+        )
+        try:
+            _remove_empty_tree(finalize_backup_root)
+        except OSError:
+            pass
+        try:
+            _remove_empty_tree(quarantine_root)
+        except OSError:
+            pass
+        if restore_errors:
+            raise TransactionError(
+                "finalize rollback was incomplete: "
+                + "; ".join(restore_errors)
+            ) from error
+        raise TransactionError("finalize rolled back") from error
+
+    for artifact in exact_artifacts:
+        artifact.unlink()
+    _remove_empty_tree(staging_root)
+    _remove_empty_tree(output_root / "reports")
+    _remove_empty_tree(output_root / "fashioniq")
+
+    result = verify_reclassification(
+        output_root,
+        expected_plan=expected_plan,
+        finalized=True,
+    )
+    if not result.ok:
+        raise TransactionError(
+            "final verification failed: " + "; ".join(result.errors)
+        )
+    return result
