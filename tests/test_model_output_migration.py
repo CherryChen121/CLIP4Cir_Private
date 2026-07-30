@@ -1,10 +1,19 @@
 from datetime import datetime, timedelta, timezone
+import csv
+import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import zipfile
 
-from model_output_migration import scan_legacy_outputs
+from model_output_migration import (
+    SourceChangedError,
+    build_migration_plan,
+    scan_legacy_outputs,
+    sha256_file,
+    write_migration_reports,
+)
 
 
 NOW = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
@@ -158,3 +167,105 @@ def test_nonempty_corrupt_checkpoint_is_unresolved(tmp_path):
 
     assert result.runs[0].classification == "unresolved"
     assert "checkpoint-format-invalid" in result.runs[0].reasons
+
+
+def test_sha256_file_matches_hashlib(tmp_path):
+    checkpoint = _write(tmp_path / "model.pt", b"abc" * 1000)
+
+    assert sha256_file(checkpoint) == hashlib.sha256(b"abc" * 1000).hexdigest()
+
+
+def test_sha256_file_rejects_changed_snapshot(tmp_path, monkeypatch):
+    checkpoint = _write(tmp_path / "model.pt", b"original")
+    original_stat = Path.stat
+    calls = 0
+
+    def changing_stat(path):
+        nonlocal calls
+        result = original_stat(path)
+        if path == checkpoint:
+            calls += 1
+            if calls == 2:
+                checkpoint.write_bytes(b"changed-size")
+                result = original_stat(path)
+        return result
+
+    monkeypatch.setattr(Path, "stat", changing_stat)
+
+    try:
+        sha256_file(checkpoint)
+    except SourceChangedError as error:
+        assert str(checkpoint) in str(error)
+    else:
+        raise AssertionError("changed file must reject its snapshot")
+
+
+def test_plan_groups_only_byte_identical_checkpoints(tmp_path):
+    source = tmp_path / "models"
+    first = source / "clip_finetuned_on_fiq_RN50x4_2026-01-01_00:00:00_000001"
+    second = source / "clip_finetuned_on_fiq_RN50x4_2026-01-02_00:00:00_000002"
+    third = source / "clip_finetuned_on_fiq_RN50x4_2026-01-03_00:00:00_000003"
+    _checkpoint(first / "saved_models/tuned.pt", b"same")
+    _checkpoint(second / "saved_models/tuned.pt", b"same")
+    _checkpoint(third / "saved_models/tuned.pt", b"diff")
+
+    plan = build_migration_plan(_scan(source, tmp_path / "outputs"))
+
+    assert len(plan.duplicate_groups) == 1
+    group = next(iter(plan.duplicate_groups.values()))
+    assert len(group) == 2
+    assert all(path.name == "tuned.pt" for path in group)
+    deduplicated = [
+        action for action in plan.actions
+        if action.status == "planned-deduplicate"
+    ]
+    assert len(deduplicated) == 1
+    assert deduplicated[0].canonical
+
+
+def test_same_size_different_hash_is_not_duplicate(tmp_path):
+    source = tmp_path / "models"
+    first = source / "clip_finetuned_on_fiq_RN50x4_2026-01-01_00:00:00_000001"
+    second = source / "clip_finetuned_on_fiq_RN50x4_2026-01-02_00:00:00_000002"
+    _checkpoint(first / "saved_models/tuned.pt", b"aaaa")
+    _checkpoint(second / "saved_models/tuned.pt", b"bbbb")
+
+    plan = build_migration_plan(_scan(source, tmp_path / "outputs"))
+
+    assert plan.duplicate_groups == {}
+
+
+def test_reports_contain_path_hash_status_and_canonical(tmp_path):
+    source = tmp_path / "models"
+    run = source / "clip_finetuned_on_fiq_RN50x4_2026-01-01_00:00:00_000001"
+    checkpoint = _checkpoint(run / "saved_models/tuned.pt", b"weights")
+    plan = build_migration_plan(_scan(source, tmp_path / "outputs"))
+
+    csv_path, json_path = write_migration_reports(plan, tmp_path / "outputs")
+
+    rows = list(csv.DictReader(csv_path.open(encoding="utf-8")))
+    assert rows[0]["old_path"].endswith("saved_models/tuned.pt")
+    assert rows[0]["new_path"].endswith("checkpoints/tuned.pt")
+    assert rows[0]["sha256"] == hashlib.sha256(
+        checkpoint.read_bytes()
+    ).hexdigest()
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+    assert report["valid_runs"] == 1
+    assert report["logical_bytes"] >= checkpoint.stat().st_size
+    assert report["status_counts"] == {"planned-move": 1}
+
+
+def test_active_unknown_and_collision_are_plan_blockers(tmp_path):
+    source = tmp_path / "models"
+    active = source / "combiner_trained_on_fiq_RN50x4_2026-01-01_00:00:00_pid7"
+    _checkpoint(active / "saved_models/combiner.pt", b"weights")
+    _write(source / "mystery.bin", b"unknown")
+
+    scan = _scan(source, tmp_path / "outputs", live_pids=(7,))
+    plan = build_migration_plan(scan)
+
+    assert plan.has_blockers
+    assert {action.status for action in plan.actions} >= {
+        "skipped-active",
+        "unresolved",
+    }
