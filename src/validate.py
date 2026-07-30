@@ -3,6 +3,7 @@ from argparse import ArgumentParser
 from operator import itemgetter
 from pathlib import Path
 from statistics import mean
+import traceback
 from typing import List, Tuple
 
 import clip
@@ -14,8 +15,26 @@ from clip.model import CLIP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data_utils import squarepad_transform, FashionIQDataset, targetpad_transform, CIRRDataset
+from data_utils import (
+    CIRRDataset,
+    FashionIQDataset,
+    list_fashioniq_categories,
+    resolve_fashioniq_root,
+    squarepad_transform,
+    targetpad_transform,
+)
 from combiner import Combiner
+from dataset_identity import (
+    resolve_dataset_identity,
+    resolve_fashioniq_evaluation_identity,
+)
+from evaluation_outputs import (
+    create_evaluation_layout,
+    discard_evaluation_metrics,
+    finalize_evaluation,
+    publish_evaluation_metrics,
+    tee_evaluation_output,
+)
 from fashioniq_evaluation import compute_recall_at_k
 from utils import extract_index_features, collate_fn, element_wise_sum, device
 
@@ -337,7 +356,58 @@ def _load_optional_clip_weights(clip_model: CLIP, clip_model_path: Path):
     _safe_load_state_dict(clip_model, clip_weights, context="Validation CLIP checkpoint")
 
 
-def main():
+def _csv_projection(args, categories, results):
+    common_fields = ["model_path", "epoch"]
+    if args.dataset.lower() == "fashioniq":
+        metric_names = ("recall_at1", "recall_at5", "recall_at10")
+        category_fields = [
+            f"{category}_{metric_name}"
+            for category in categories
+            for metric_name in metric_names
+        ]
+        aggregate_fields = [
+            "average_recall_at1",
+            "average_recall_at5",
+            "average_recall_at10",
+        ]
+        fieldnames = common_fields + category_fields + aggregate_fields
+        rows = []
+        for result in results:
+            row = {field: result.get(field) for field in common_fields}
+            for category in categories:
+                for metric_name in metric_names:
+                    row[f"{category}_{metric_name}"] = (
+                        result["per_category"][category][metric_name]
+                    )
+            for field in aggregate_fields:
+                row[field] = result["aggregate"][field]
+            rows.append(row)
+        return rows, fieldnames
+
+    aggregate_fields = [
+        "group_recall_at1",
+        "group_recall_at2",
+        "group_recall_at3",
+        "global_recall_at1",
+        "global_recall_at5",
+        "global_recall_at10",
+        "global_recall_at50",
+    ]
+    fieldnames = common_fields + aggregate_fields
+    rows = []
+    for result in results:
+        row = {field: result.get(field) for field in common_fields}
+        row.update(
+            {
+                field: result["aggregate"][field]
+                for field in aggregate_fields
+            }
+        )
+        rows.append(row)
+    return rows, fieldnames
+
+
+def build_parser():
     parser = ArgumentParser()
     parser.add_argument("--dataset", type=str, required=True, help="should be either 'CIRR' or 'fashionIQ'")
     parser.add_argument("--combining-function", type=str, required=True,
@@ -369,9 +439,25 @@ def main():
         default="val",
         help="Labeled FashionIQ-format split to evaluate",
     )
+    parser.add_argument(
+        "--output-root",
+        default=None,
+        help="Evaluation output root; defaults to the project outputs directory",
+    )
+    parser.add_argument(
+        "--output-dataset",
+        default=None,
+        help="Explicit actual dataset name used beneath the output root",
+    )
+    parser.add_argument(
+        "--evaluation-name",
+        default="validation",
+        help="Descriptive label recorded in the evaluation manifest",
+    )
+    return parser
 
-    args = parser.parse_args()
 
+def _run_evaluation(args, categories):
     if _is_blip_model_name(args.clip_model_name):
         try:
             from src.blip_adapter import BLIPAdapter
@@ -423,32 +509,37 @@ def main():
         group_recall_at1, group_recall_at2, group_recall_at3, recall_at1, recall_at5, recall_at10, recall_at50 = \
             cirr_val_retrieval(combining_function, clip_model, preprocess)
 
-        print(f"{group_recall_at1 = }")
-        print(f"{group_recall_at2 = }")
-        print(f"{group_recall_at3 = }")
-        print(f"{recall_at1 = }")
-        print(f"{recall_at5 = }")
-        print(f"{recall_at10 = }")
-        print(f"{recall_at50 = }")
+        aggregate = {
+            "group_recall_at1": group_recall_at1,
+            "group_recall_at2": group_recall_at2,
+            "group_recall_at3": group_recall_at3,
+            "global_recall_at1": recall_at1,
+            "global_recall_at5": recall_at5,
+            "global_recall_at10": recall_at10,
+            "global_recall_at50": recall_at50,
+        }
+        for name, value in aggregate.items():
+            print(f"{name} = {value}")
+        return [
+            {
+                "model_path": (
+                    str(args.clip_model_path)
+                    if args.clip_model_path
+                    else None
+                ),
+                "epoch": None,
+                "per_category": {},
+                "aggregate": aggregate,
+            }
+        ]
 
     elif args.dataset.lower() == 'fashioniq':
         average_recall1_list = []
         average_recall5_list = []
         average_recall10_list = []
+        per_category = {}
 
-        from data_utils import list_fashioniq_categories
-        valid_dress_types = args.dress_types or list_fashioniq_categories(
-            args.fashioniq_split, args.fashioniq_root)
-        
-        # fallback if not found
-        if not valid_dress_types:
-            if args.fashioniq_root:
-                raise FileNotFoundError(
-                    f"No FashionIQ-format categories found for split "
-                    f"{args.fashioniq_split} under {args.fashioniq_root}")
-            valid_dress_types = ['shirt', 'dress', 'toptee']
-
-        for dt in valid_dress_types:
+        for dt in categories:
             r1, r5, r10 = fashioniq_val_retrieval(
                 dt,
                 combining_function,
@@ -460,16 +551,144 @@ def main():
             average_recall1_list.append(r1)
             average_recall5_list.append(r5)
             average_recall10_list.append(r10)
-            
+
+            per_category[dt] = {
+                "recall_at1": r1,
+                "recall_at5": r5,
+                "recall_at10": r10,
+            }
             print(f"{dt}_recallat1 = {r1}")
             print(f"{dt}_recallat5 = {r5}")
             print(f"{dt}_recallat10 = {r10}")
 
-        print(f"average recall1 = {mean(average_recall1_list)}")
-        print(f"average recall5 = {mean(average_recall5_list)}")
-        print(f"average recall10 = {mean(average_recall10_list)}")
+        aggregate = {
+            "average_recall_at1": mean(average_recall1_list),
+            "average_recall_at5": mean(average_recall5_list),
+            "average_recall_at10": mean(average_recall10_list),
+        }
+        print(f"average recall1 = {aggregate['average_recall_at1']}")
+        print(f"average recall5 = {aggregate['average_recall_at5']}")
+        print(f"average recall10 = {aggregate['average_recall_at10']}")
+        return [
+            {
+                "model_path": (
+                    str(args.clip_model_path)
+                    if args.clip_model_path
+                    else None
+                ),
+                "epoch": None,
+                "per_category": per_category,
+                "aggregate": aggregate,
+            }
+        ]
     else:
         raise ValueError("Dataset should be either 'CIRR' or 'FashionIQ")
+
+
+def _metrics_document(identity, args, results):
+    split = (
+        args.fashioniq_split
+        if args.dataset.lower() == "fashioniq"
+        else "val"
+    )
+    return {
+        "schema_version": 1,
+        "dataset": identity.dataset_slug,
+        "dataset_format": identity.dataset_format,
+        "evaluation_name": args.evaluation_name,
+        "split": split,
+        "results": results,
+    }
+
+
+def _resolve_evaluation_identity(args, project_root):
+    if args.dataset.lower() == "fashioniq":
+        categories = args.dress_types or list_fashioniq_categories(
+            args.fashioniq_split,
+            args.fashioniq_root,
+        )
+        if not categories:
+            root_description = (
+                f" under {args.fashioniq_root}"
+                if args.fashioniq_root
+                else ""
+            )
+            raise FileNotFoundError(
+                "No FashionIQ-format categories found for split "
+                f"{args.fashioniq_split}{root_description}"
+            )
+        identity = resolve_fashioniq_evaluation_identity(
+            project_root=project_root,
+            dress_types=categories,
+            split=args.fashioniq_split,
+            dataset_root=args.fashioniq_root,
+            output_dataset=args.output_dataset,
+            root_resolver=resolve_fashioniq_root,
+        )
+        return identity, categories, args.fashioniq_split
+
+    if args.dataset.lower() == "cirr":
+        identity = resolve_dataset_identity(
+            dataset_format="cirr",
+            dress_types=(),
+            dataset_root_requested=None,
+            dataset_root_resolved=None,
+            output_dataset=args.output_dataset,
+        )
+        return identity, [], "val"
+
+    raise ValueError("Dataset should be either 'CIRR' or 'FashionIQ")
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    project_root = Path(__file__).resolve().parents[1]
+    identity, categories, split = _resolve_evaluation_identity(
+        args,
+        project_root,
+    )
+    layout = create_evaluation_layout(
+        project_root=project_root,
+        output_root=args.output_root,
+        identity=identity,
+        evaluation_script="src/validate.py",
+        evaluation_name=args.evaluation_name,
+        model_name=args.clip_model_name,
+        split=split,
+        categories=categories,
+        cli_args=vars(args),
+        input_paths={
+            "clip_model_path": args.clip_model_path,
+            "combiner_path": args.combiner_path,
+        },
+    )
+
+    try:
+        with tee_evaluation_output(layout.log):
+            try:
+                print(f"Evaluation output directory: {layout.root}")
+                results = _run_evaluation(args, categories)
+                document = _metrics_document(identity, args, results)
+                rows, fieldnames = _csv_projection(
+                    args,
+                    categories,
+                    results,
+                )
+                publish_evaluation_metrics(
+                    layout,
+                    document,
+                    rows,
+                    fieldnames,
+                )
+            except BaseException:
+                traceback.print_exc()
+                raise
+    except BaseException as error:
+        discard_evaluation_metrics(layout)
+        finalize_evaluation(layout, "failed", error=error)
+        raise
+    else:
+        finalize_evaluation(layout, "succeeded")
 
 
 if __name__ == '__main__':
