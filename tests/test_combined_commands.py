@@ -158,3 +158,34 @@ def test_existing_uwf_and_idrid_commands_remain_byte_for_byte_unchanged():
     _, legacy, _ = _command_parts()
 
     assert hashlib.sha256(legacy.encode()).hexdigest() == LEGACY_SUFFIX_SHA256
+
+
+def test_combined_validation_templates_route_outputs_by_actual_dataset():
+    combined, _, _ = _command_parts()
+    validation_commands = [
+        line
+        for line in combined.splitlines()
+        if line.startswith("# CUDA_VISIBLE_DEVICES=")
+        and "python src/validate.py " in line
+    ]
+
+    assert len(validation_commands) == 3
+    assert all(
+        "--output-dataset combined-fundus-cir" in line
+        for line in validation_commands
+    )
+    assert {
+        re.search(
+            r"--evaluation-name\s+(\S+)",
+            line,
+        ).group(1)
+        for line in validation_commands
+    } == {"internal-test", "odir5k-test", "grape-test"}
+    assert all(
+        "eval_combined_" not in line
+        for line in validation_commands
+    )
+    assert all(
+        line.endswith("> /dev/null 2>&1 &")
+        for line in validation_commands
+    )

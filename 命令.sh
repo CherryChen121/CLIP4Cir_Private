@@ -141,9 +141,9 @@ CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py --d
 # Combined 带真值 test 评估示例（按测试域分别执行）
 # 将模型名、checkpoint 和 combining-function 调整为对应训练产物。
 # ------------------------------
-# CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/validate.py --dataset FashionIQ --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --dress-types Internal --fashioniq-split test --combining-function sum --clip-model-name ViT-B/32 --transform targetpad --target-ratio 1.25 > eval_combined_internal_test.log 2>&1 &
-# CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/validate.py --dataset FashionIQ --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --dress-types ODIR5K --fashioniq-split test --combining-function sum --clip-model-name ViT-B/32 --transform targetpad --target-ratio 1.25 > eval_combined_odir5k_test.log 2>&1 &
-# CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/validate.py --dataset FashionIQ --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --dress-types GRAPE --fashioniq-split test --combining-function sum --clip-model-name ViT-B/32 --transform targetpad --target-ratio 1.25 > eval_combined_grape_test.log 2>&1 &
+# CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/validate.py --dataset FashionIQ --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --dress-types Internal --fashioniq-split test --output-dataset combined-fundus-cir --evaluation-name internal-test --combining-function sum --clip-model-name ViT-B/32 --transform targetpad --target-ratio 1.25 > /dev/null 2>&1 &
+# CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/validate.py --dataset FashionIQ --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --dress-types ODIR5K --fashioniq-split test --output-dataset combined-fundus-cir --evaluation-name odir5k-test --combining-function sum --clip-model-name ViT-B/32 --transform targetpad --target-ratio 1.25 > /dev/null 2>&1 &
+# CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 nohup python src/validate.py --dataset FashionIQ --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset --dress-types GRAPE --fashioniq-split test --output-dataset combined-fundus-cir --evaluation-name grape-test --combining-function sum --clip-model-name ViT-B/32 --transform targetpad --target-ratio 1.25 > /dev/null 2>&1 &
 
 # COMBINED_COMMANDS_END
 

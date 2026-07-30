@@ -279,13 +279,33 @@ RetiZero is a fundus-specific vision-language model pre-trained on 341,896 fundu
 
 ## Validation
 
-Compute Recall@1 and Recall@10 per category and overall average recall:
+Validation results use the same actual-dataset-first organization as training:
+
+```text
+outputs/<actual-dataset>/evaluation/<model>/<run-id>/
+├── evaluation_manifest.json
+├── evaluation_metrics.json
+├── evaluation_metrics.csv
+└── evaluation.log
+```
+
+The manifest records the physical dataset root, classification evidence,
+model/checkpoint inputs, split, categories, complete CLI arguments, and final
+status. A successful run contains both JSON and spreadsheet-friendly CSV
+metrics. An allocated failed run retains its manifest and log but does not
+publish final metric files.
+
+Compute Recall@1, Recall@5, and Recall@10 per category and overall averages:
 
 ```bash
 # CLIP backbone
 python src/validate.py \
    --dataset FashionIQ \
+   --fashioniq-root /data0/qrchen/datasets/UWF_CIR_Dataset_cold \
    --dress-types CH CO NM RB RCH UM \
+   --fashioniq-split val \
+   --output-dataset uwf \
+   --evaluation-name uwf-val \
    --combining-function combiner \
    --combiner-path outputs/uwf/combiner/<model>/<run-id>/checkpoints/combiner.pt \
    --projection-dim 2560 \
@@ -299,8 +319,19 @@ python src/validate.py \
 python src/validate_retizero_lora.py \
     --model-paths outputs/uwf/clip-finetune/retizero/<run-id>/checkpoints/*.pt \
     --base-weight-path pretrained_models/fashionIQ/RetiZero.pth \
-    --output-csv results_retizero.csv
+    --fashioniq-root /data0/qrchen/datasets/UWF_CIR_Dataset_cold \
+    --dress-types CH CO NM RB RCH UM \
+    --fashioniq-split val \
+    --output-dataset uwf \
+    --evaluation-name retizero-uwf-val \
+    --output-csv evaluation_metrics.csv
 ```
+
+Both scripts default `--output-root` to the project `outputs/` directory and
+accept `--output-dataset` when the actual dataset should be explicit.
+`validate_retizero_lora.py --output-csv` accepts only a filename within the
+allocated evaluation run; absolute paths and directory components are
+rejected.
 
 ---
 
