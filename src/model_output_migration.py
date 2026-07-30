@@ -661,8 +661,38 @@ def migration_report_payload(plan: MigrationPlan) -> dict:
     reclaimable_bytes = sum(
         action.size
         for action in plan.actions
-        if action.status == "planned-deduplicate"
+        if action.status in {"planned-deduplicate", "deduplicated"}
     )
+    final_statuses = {"moved", "deduplicated"}
+    if any(action.status in final_statuses for action in plan.actions):
+        seen_inodes = set()
+        physical_bytes_after = 0
+        for action in plan.actions:
+            if (
+                action.status not in final_statuses
+                or action.destination is None
+                or not action.destination.is_file()
+            ):
+                continue
+            stat_result = action.destination.stat()
+            inode = (stat_result.st_dev, stat_result.st_ino)
+            if inode in seen_inodes:
+                continue
+            seen_inodes.add(inode)
+            physical_bytes_after += stat_result.st_blocks * 512
+    else:
+        reclaimable_physical_bytes = sum(
+            action.source.stat().st_blocks * 512
+            for action in plan.actions
+            if (
+                action.status == "planned-deduplicate"
+                and action.source.exists()
+            )
+        )
+        physical_bytes_after = max(
+            0,
+            plan.physical_bytes_before - reclaimable_physical_bytes,
+        )
     return {
         "total_runs": len(plan.scan.runs),
         "valid_runs": sum(
@@ -684,6 +714,7 @@ def migration_report_payload(plan: MigrationPlan) -> dict:
         ),
         "logical_bytes": plan.logical_bytes,
         "physical_bytes_before": plan.physical_bytes_before,
+        "physical_bytes_after": physical_bytes_after,
         "duplicate_groups": len(plan.duplicate_groups),
         "duplicate_files": duplicate_files,
         "reclaimable_bytes": reclaimable_bytes,

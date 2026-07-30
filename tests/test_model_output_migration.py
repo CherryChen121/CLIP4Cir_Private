@@ -5,6 +5,8 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import zipfile
 
 import pytest
@@ -26,6 +28,8 @@ from model_output_migration import (
 
 
 NOW = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MIGRATION_SCRIPT = PROJECT_ROOT / "scripts/organize_model_outputs.py"
 
 
 def _write(path: Path, data: bytes) -> Path:
@@ -318,6 +322,12 @@ def test_apply_deduplicates_verifies_and_finalize_removes_source(tmp_path):
         "deduplicated",
         "deleted-failed",
     }
+    report = json.loads(
+        (output / "migration_report.json").read_text(encoding="utf-8")
+    )
+    duplicate_size = checkpoint_paths[0].stat().st_size
+    assert report["reclaimable_bytes"] == duplicate_size
+    assert report["physical_bytes_after"] < report["physical_bytes_before"]
 
     finalize_source(source, verification)
 
@@ -446,3 +456,51 @@ def test_find_legacy_writer_pids_resolves_relative_script(tmp_path):
 
     assert find_legacy_writer_pids(project, proc_root=proc) == (123,)
     assert script.exists()
+
+
+def test_cli_dry_run_does_not_modify_source_or_output(tmp_path):
+    source = tmp_path / "models"
+    run = source / "clip_finetuned_on_fiq_RN50x4_2026-01-01_00:00:00_000001"
+    checkpoint = _checkpoint(run / "saved_models/tuned.pt", b"weights")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(MIGRATION_SCRIPT),
+            "--source",
+            str(source),
+            "--output-root",
+            str(tmp_path / "outputs"),
+        ],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert checkpoint.exists()
+    assert not (tmp_path / "outputs").exists()
+    assert '"valid_runs": 1' in result.stdout
+
+
+def test_cli_modes_are_mutually_exclusive(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(MIGRATION_SCRIPT),
+            "--source",
+            str(tmp_path / "models"),
+            "--output-root",
+            str(tmp_path / "outputs"),
+            "--apply",
+            "--finalize",
+        ],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 2
+    assert "not allowed with argument" in result.stderr
