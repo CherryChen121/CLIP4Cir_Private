@@ -44,6 +44,7 @@ def test_create_run_layout_writes_manifest_and_sanitizes_model(tmp_path):
         project_root=tmp_path,
         output_root=None,
         dataset="FashionIQ",
+        dataset_format="fashioniq",
         stage="combiner",
         model_name="ViT-B/32",
         started_at=datetime(2026, 7, 30, 9, 50, 58, 123456),
@@ -59,6 +60,8 @@ def test_create_run_layout_writes_manifest_and_sanitizes_model(tmp_path):
     assert payload["model_name"] == "ViT-B/32"
     assert payload["model_slug"] == "vit-b-32"
     assert payload["checkpoint_dir"] == "checkpoints"
+    assert payload["dataset"] == "fashioniq"
+    assert payload["dataset_format"] == "fashioniq"
 
 
 def test_create_run_layout_never_reuses_existing_run(tmp_path):
@@ -66,6 +69,7 @@ def test_create_run_layout_never_reuses_existing_run(tmp_path):
         "project_root": tmp_path,
         "output_root": None,
         "dataset": "CIRR",
+        "dataset_format": "cirr",
         "stage": "clip-finetune",
         "model_name": "RN50x4",
         "started_at": datetime(2026, 7, 30, 9, 50, 58, 123456),
@@ -82,6 +86,38 @@ def test_create_run_layout_rejects_unknown_stage(tmp_path):
             project_root=tmp_path,
             output_root=None,
             dataset="FashionIQ",
+            dataset_format="fashioniq",
             stage="unknown",
             model_name="RN50x4",
         )
+
+
+def test_create_run_layout_records_actual_dataset_identity(tmp_path):
+    layout = create_run_layout(
+        project_root=tmp_path,
+        output_root=None,
+        dataset="combined-fundus-cir",
+        dataset_format="fashioniq",
+        dataset_root_requested="/datasets/combined",
+        dataset_root_resolved="/datasets/combined",
+        dataset_classification_evidence=("resolved-root:combined",),
+        stage="combiner",
+        model_name="ViT-L/14",
+        started_at=datetime(2026, 7, 30, 9, 51, 41),
+        pid=2393301,
+    )
+
+    payload = json.loads(layout.manifest.read_text(encoding="utf-8"))
+    assert layout.root == (
+        tmp_path
+        / "outputs/combined-fundus-cir/combiner/vit-l-14/"
+        "20260730-095141-000000-p2393301"
+    )
+    assert payload["dataset"] == "combined-fundus-cir"
+    assert payload["dataset_slug"] == "combined-fundus-cir"
+    assert payload["dataset_format"] == "fashioniq"
+    assert payload["dataset_root_requested"] == "/datasets/combined"
+    assert payload["dataset_root_resolved"] == "/datasets/combined"
+    assert payload["dataset_classification_evidence"] == [
+        "resolved-root:combined"
+    ]

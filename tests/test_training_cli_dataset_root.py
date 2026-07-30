@@ -28,4 +28,5 @@ def test_training_cli_exposes_explicit_fashioniq_root(script):
 
     assert result.returncode == 0, result.stderr
     assert "--fashioniq-root" in result.stdout
+    assert "--output-dataset" in result.stdout
     assert "--retizero-base-path" in result.stdout
