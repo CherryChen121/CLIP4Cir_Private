@@ -176,6 +176,17 @@ def test_gpu_becomes_candidate_only_on_fifth_consecutive_sample():
     assert 0 in policy.observe(_snapshots())
 
 
+def test_idle_policy_exposes_streak_by_gpu_uuid():
+    policy = IdlePolicy(expected_indices=range(8))
+    snapshots = _snapshots()
+
+    policy.observe(snapshots)
+    policy.observe(snapshots)
+
+    assert policy.idle_streak("GPU-0") == 2
+    assert policy.idle_streak("GPU-never-seen") == 0
+
+
 def test_busy_sample_resets_consecutive_idle_count():
     policy = IdlePolicy(expected_indices=range(8))
     for _ in range(4):

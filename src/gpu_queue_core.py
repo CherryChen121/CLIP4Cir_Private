@@ -85,6 +85,9 @@ class IdlePolicy:
             and snapshot.utilization_percent <= self.utilization_limit_percent
         )
 
+    def idle_streak(self, gpu_uuid: str) -> int:
+        return int(self._counts.get(gpu_uuid, 0))
+
     def observe(self, snapshots: Sequence[GpuSnapshot]) -> Tuple[int, ...]:
         by_index = {snapshot.index: snapshot for snapshot in snapshots}
         if tuple(sorted(by_index)) != tuple(sorted(self.expected_indices)):
