@@ -23,6 +23,7 @@ from torchvision.transforms.functional import InterpolationMode
 
 from data_utils import base_path, squarepad_transform, FashionIQDataset, targetpad_transform, CIRRDataset, SquarePad, TargetPad, ToClipTensor
 from combiner import Combiner
+from output_paths import create_run_layout
 from utils import collate_fn, update_train_running_results, set_train_bar_description, save_model, \
     extract_index_features, generate_randomized_fiq_caption, device
 from validate import compute_cirr_val_metrics, compute_fiq_val_metrics
@@ -247,11 +248,14 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S") + f"_pid{os.getpid()}"
-    model_tag = _safe_model_tag(clip_model_name)
-    training_path: Path = Path(
-        base_path / f"models/combiner_trained_on_fiq_{model_tag}_{training_start}")
-    training_path.mkdir(exist_ok=False, parents=True)
+    layout = create_run_layout(
+        project_root=base_path,
+        output_root=kwargs.get("output_root"),
+        dataset="fashioniq",
+        stage="combiner",
+        model_name=clip_model_name,
+    )
+    training_path = layout.root
 
     # 保存超参数
     with open(training_path / "training_hyperparameters.json", 'w+') as file:
@@ -781,10 +785,14 @@ def combiner_training_cirr(projection_dim: int, hidden_dim: int, num_epochs: int
                 fine-tuned version of clip you should provide `clip_model_path` as kwarg.
     """
 
-    training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-    training_path: Path = Path(
-        base_path / f"models/combiner_trained_on_cirr_{clip_model_name}_{training_start}")
-    training_path.mkdir(exist_ok=False, parents=True)
+    layout = create_run_layout(
+        project_root=base_path,
+        output_root=kwargs.get("output_root"),
+        dataset="cirr",
+        stage="combiner",
+        model_name=clip_model_name,
+    )
+    training_path = layout.root
 
     # Save all the hyperparameters on a file
     with open(training_path / "training_hyperparameters.json", 'w+') as file:
@@ -1026,6 +1034,12 @@ if __name__ == '__main__':
     parser.add_argument("--api-key", type=str, help="api for Comet logging")
     parser.add_argument("--workspace", type=str, help="workspace of Comet logging")
     parser.add_argument("--experiment-name", type=str, help="name of the experiment on Comet")
+    parser.add_argument(
+        "--output-root",
+        type=str,
+        default=None,
+        help="Training output root; relative paths are resolved from the project root",
+    )
     parser.add_argument("--projection-dim", default=640 * 4, type=int, help='Combiner projection dim')
     parser.add_argument("--hidden-dim", default=640 * 8, type=int, help="Combiner hidden dim")
     parser.add_argument("--num-epochs", default=300, type=int, help="number training epochs")
@@ -1098,6 +1112,7 @@ if __name__ == '__main__':
         "clip_model_name": args.clip_model_name,
         "clip_model_path": args.clip_model_path,
         "fashioniq_root": args.fashioniq_root,
+        "output_root": args.output_root,
         "combiner_lr": args.combiner_lr,
         "weight_decay": args.weight_decay,
         "max_grad_norm": args.max_grad_norm,

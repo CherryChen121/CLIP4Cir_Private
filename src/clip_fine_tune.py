@@ -22,6 +22,7 @@ from data_utils import (
     base_path, squarepad_transform, targetpad_transform, CIRRDataset, FashionIQDataset,
     ToClipTensor, list_fashioniq_categories
 )
+from output_paths import create_run_layout
 from utils import collate_fn, update_train_running_results, set_train_bar_description, extract_index_features, \
     save_model, generate_randomized_fiq_caption, element_wise_sum, device
 from validate import compute_cirr_val_metrics, compute_fiq_val_metrics
@@ -386,11 +387,20 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
     :param kwargs: if you use the `targetpad` transform you should prove `target_ratio` as kwarg
     """
 
-    training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S_%f")
-    model_tag = _safe_model_tag(clip_model_name)
-    training_path: Path = Path(
-        base_path / f"models/clip_finetuned_on_fiq_{model_tag}_{training_start}")
-    training_path.mkdir(exist_ok=True, parents=True)
+    layout = create_run_layout(
+        project_root=base_path,
+        output_root=kwargs.get("output_root"),
+        dataset="fashioniq",
+        stage="clip-finetune",
+        model_name=clip_model_name,
+    )
+    training_path = layout.root
+
+    with (training_path / "training_hyperparameters.json").open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(training_hyper_params, file, sort_keys=True, indent=4)
 
     clip_model, clip_preprocess = _load_model_for_finetune(clip_model_name, kwargs)
 
@@ -655,10 +665,14 @@ def clip_finetune_cirr(num_epochs: int, clip_model_name: str, learning_rate: flo
     :param kwargs: if you use the `targetpad` transform you should prove `target_ratio`    :return:
     """
 
-    training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S_%f")
-    training_path: Path = Path(
-        base_path / f"models/clip_finetuned_on_cirr_{clip_model_name}_{training_start}")
-    training_path.mkdir(exist_ok=True, parents=True)
+    layout = create_run_layout(
+        project_root=base_path,
+        output_root=kwargs.get("output_root"),
+        dataset="cirr",
+        stage="clip-finetune",
+        model_name=clip_model_name,
+    )
+    training_path = layout.root
 
     # Save all the hyperparameters on a file
     with open(training_path / "training_hyperparameters.json", 'w+') as file:
@@ -863,6 +877,12 @@ if __name__ == '__main__':
     parser.add_argument("--api-key", type=str, help="api for Comet logging")
     parser.add_argument("--workspace", type=str, help="workspace of Comet logging")
     parser.add_argument("--experiment-name", type=str, help="name of the experiment on Comet")
+    parser.add_argument(
+        "--output-root",
+        type=str,
+        default=None,
+        help="Training output root; relative paths are resolved from the project root",
+    )
     parser.add_argument("--num-epochs", default=300, type=int, help="number training epochs")
     parser.add_argument("--dress-types", nargs='+', default=None,
                         help="FashionIQ-format categories to use, e.g. IDRiD or CH CO NM RB RCH UM")
@@ -930,6 +950,7 @@ if __name__ == '__main__':
         "num_epochs": args.num_epochs,
         "dress_types": args.dress_types,
         "fashioniq_root": args.fashioniq_root,
+        "output_root": args.output_root,
         "clip_model_name": args.clip_model_name,
         "learning_rate": args.learning_rate,
         "scheduler_patience": args.scheduler_patience,
