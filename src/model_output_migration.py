@@ -1089,7 +1089,10 @@ def apply_migration(plan: MigrationPlan) -> MigrationPlan:
         for action in plan.actions:
             if action.kind != "report" or action.destination is None:
                 continue
-            staged = staging_root / "reports" / action.source.name
+            staged = (
+                staging_root
+                / action.destination.relative_to(output_root)
+            )
             staged.parent.mkdir(parents=True, exist_ok=True)
             action.source.replace(staged)
             report_locations[action.source] = staged

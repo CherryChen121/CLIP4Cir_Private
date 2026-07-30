@@ -215,6 +215,16 @@ def test_same_named_legacy_reports_keep_relative_paths(tmp_path):
         for action in report_actions.values()
     )
 
+    apply_migration(plan)
+
+    assert not clip_report.exists()
+    assert not combiner_report.exists()
+    assert report_actions[clip_report].destination.read_bytes() == b"clip"
+    assert (
+        report_actions[combiner_report].destination.read_bytes()
+        == b"combiner"
+    )
+
 
 def test_nonempty_corrupt_checkpoint_is_unresolved(tmp_path):
     source = tmp_path / "models"
