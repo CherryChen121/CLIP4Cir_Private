@@ -1006,6 +1006,11 @@ def test_dry_run_reports_all_occupied_gpus_without_creating_state(tmp_path):
     assert not dependencies.runtime_root.exists()
     assert len([line for line in output if "compute_pids=" in line]) == 8
     assert all("unavailable" in line for line in output if "compute_pids=" in line)
+    assert any(
+        "policy: at most 4 GPU leases; first use requires 5 samples; "
+        "same-GPU reuse waits 60 seconds" in line
+        for line in output
+    )
 
 
 def test_shell_wrapper_rejects_unknown_mode():

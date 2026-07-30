@@ -723,6 +723,10 @@ def main(argv=None, dependencies=None) -> int:
             f"preflight ok: {len(queue.tasks)} commands "
             f"(Phase A=10, Phase B=10), digest={queue.command_sha256}"
         )
+        deps.output(
+            "policy: at most 4 GPU leases; first use requires 5 samples; "
+            "same-GPU reuse waits 60 seconds"
+        )
         for gpu in snapshots:
             deps.output(_audit_line(gpu))
         deps.output("dry-run only: no state created and no training process launched")

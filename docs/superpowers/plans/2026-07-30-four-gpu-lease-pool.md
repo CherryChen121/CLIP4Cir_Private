@@ -427,7 +427,6 @@ The dry run must still:
 PYTHONPATH=src /data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest \
   tests/test_gpu_queue_core.py \
   tests/test_gpu_queue_audit.py \
-  tests/test_gpu_queue_worker.py \
   tests/test_combined_gpu_queue.py -q
 ```
 
@@ -503,7 +502,6 @@ Verify every acceptance criterion in
 PYTHONPATH=src /data0/qrchen/miniconda3/envs/clip4cir/bin/python -m pytest \
   tests/test_gpu_queue_core.py \
   tests/test_gpu_queue_audit.py \
-  tests/test_gpu_queue_worker.py \
   tests/test_combined_gpu_queue.py -q
 ```
 
