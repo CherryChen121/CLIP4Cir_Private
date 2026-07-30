@@ -19,6 +19,7 @@ try:
     from gpu_queue_core import (
         AtomicStateStore,
         GpuSnapshot,
+        GpuMappingError,
         IdlePolicy,
         MAX_GPU_LEASES,
         ProbeError,
@@ -26,6 +27,7 @@ try:
         ResumeError,
         TaskSpec,
         acquire_lease,
+        all_tasks_terminal,
         initial_state,
         lease_for_gpu,
         mark_running,
@@ -37,6 +39,7 @@ try:
         record_interrupted,
         record_launch_failed,
         release_lease,
+        terminal_summary,
         validate_resume_state,
     )
     from gpu_queue_audit import (
@@ -49,6 +52,7 @@ except ImportError:
     from src.gpu_queue_core import (
         AtomicStateStore,
         GpuSnapshot,
+        GpuMappingError,
         IdlePolicy,
         MAX_GPU_LEASES,
         ProbeError,
@@ -56,6 +60,7 @@ except ImportError:
         ResumeError,
         TaskSpec,
         acquire_lease,
+        all_tasks_terminal,
         initial_state,
         lease_for_gpu,
         mark_running,
@@ -67,6 +72,7 @@ except ImportError:
         record_interrupted,
         record_launch_failed,
         release_lease,
+        terminal_summary,
         validate_resume_state,
     )
     from src.gpu_queue_audit import (
@@ -336,15 +342,9 @@ class Dispatcher:
         if not was_paused and self.state.get("paused_reason"):
             self.event_logger(format_queue_pause(self.state["paused_reason"]))
 
-    def _pause_probe_error(self, exc: Exception):
-        if not self.state.get("paused_reason"):
-            self.state["paused_reason"] = {
-                "kind": "gpu_probe_error",
-                "detail": str(exc),
-                "detected_at": self.now(),
-            }
-            self._save()
-            self.event_logger(format_queue_pause(self.state["paused_reason"]))
+    def _log_probe_error(self, exc: Exception) -> None:
+        detail = "_".join(str(exc).split()) or "unknown"
+        self.event_logger(f"GPU_PROBE_ERROR detail={detail}")
 
     def _poll_results(self):
         for task in list(self._running_tasks()):
@@ -548,15 +548,19 @@ class Dispatcher:
         self._poll_results()
         try:
             snapshots = self.probe.snapshot()
+        except GpuMappingError:
+            raise
         except ProbeError as exc:
-            self._pause_probe_error(exc)
+            self._log_probe_error(exc)
             return
         candidates = ()
         if sample_idle and not self.state.get("paused_reason"):
             try:
                 candidates = self.idle_policy.observe(snapshots)
+            except GpuMappingError:
+                raise
             except ProbeError as exc:
-                self._pause_probe_error(exc)
+                self._log_probe_error(exc)
                 return
         if sample_idle:
             self._audit_snapshots(snapshots)
@@ -564,8 +568,10 @@ class Dispatcher:
             return
         try:
             self._process_ready_cooldowns(snapshots)
+        except GpuMappingError:
+            raise
         except ProbeError as exc:
-            self._pause_probe_error(exc)
+            self._log_probe_error(exc)
             return
         if not sample_idle:
             return
@@ -585,8 +591,10 @@ class Dispatcher:
                 continue
             try:
                 final_gpu = self._final_idle_check(index, initial_gpu.uuid)
+            except GpuMappingError:
+                raise
             except ProbeError as exc:
-                self._pause_probe_error(exc)
+                self._log_probe_error(exc)
                 return
             if final_gpu is None:
                 continue
@@ -600,15 +608,28 @@ class Dispatcher:
     def run_forever(self) -> int:
         cycle = 0
         while True:
+            if all_tasks_terminal(self.state):
+                leases = list(self.state.get("leases", []))
+                for lease in leases:
+                    self._release(lease, "queue_complete", save=False)
+                if leases:
+                    self._save()
+                if not self._completion_logged:
+                    summary = terminal_summary(self.state)
+                    self.event_logger(
+                        "QUEUE_COMPLETE "
+                        f"total={summary['total']} "
+                        f"succeeded={summary['succeeded']} "
+                        f"failed={summary['failed']} "
+                        f"launch_failed={summary['launch_failed']} "
+                        f"interrupted={summary['interrupted']}"
+                    )
+                    self._completion_logged = True
+                return 0
             self.run_cycle(sample_idle=(cycle % 2 == 0))
             running = self._running_tasks()
             if self.state.get("paused_reason") and not running:
                 return 2
-            if all(task["status"] == "succeeded" for task in self.state["tasks"]):
-                if not self._completion_logged:
-                    self.event_logger("QUEUE_COMPLETE")
-                    self._completion_logged = True
-                return 0
             cycle += 1
             self.sleeper(30)
 

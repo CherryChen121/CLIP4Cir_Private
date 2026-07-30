@@ -22,6 +22,7 @@ from combined_gpu_queue import (
 )
 from gpu_queue_core import (
     GpuSnapshot,
+    GpuMappingError,
     IdlePolicy,
     ProbeError,
     QueueSpec,
@@ -578,6 +579,128 @@ def test_launch_failure_is_terminal_and_does_not_pause_queue(tmp_path):
     assert any("TASK_END task=A01" in event and "LAUNCH_FAILED" in event for event in events)
 
 
+def test_launch_failure_does_not_block_next_candidate(tmp_path):
+    class FirstFailingLauncher(DispatcherLauncher):
+        def start(self, task, gpu, task_dir):
+            if task.task_id == "A01":
+                raise ProcessIdentityError("first launch failed")
+            return super().start(task, gpu, task_dir)
+
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    launcher = FirstFailingLauncher()
+    dispatcher = Dispatcher(
+        queue,
+        state,
+        tmp_path,
+        StaticProbe(_eight_snapshots()),
+        EligiblePolicy([2, 3]),
+        launcher,
+        Descendants(),
+        MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "now",
+    )
+
+    dispatcher.run_cycle(sample_idle=True)
+
+    assert state["tasks"][0]["status"] == "launch_failed"
+    assert launcher.assignments == [("A02", 3)]
+    assert state["paused_reason"] is None
+
+
+def test_transient_probe_error_skips_cycle_and_later_recovers(tmp_path):
+    class FlakyProbe:
+        def __init__(self):
+            self.calls = 0
+
+        def snapshot(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise ProbeError("driver temporarily unavailable")
+            return _eight_snapshots()
+
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    launcher = DispatcherLauncher()
+    events = []
+    dispatcher = Dispatcher(
+        queue,
+        state,
+        tmp_path,
+        FlakyProbe(),
+        EligiblePolicy([0]),
+        launcher,
+        Descendants(),
+        MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "now",
+        event_logger=events.append,
+    )
+
+    dispatcher.run_cycle(sample_idle=True)
+    assert launcher.assignments == []
+    assert state["paused_reason"] is None
+    assert events == [
+        "GPU_PROBE_ERROR detail=driver_temporarily_unavailable"
+    ]
+
+    dispatcher.run_cycle(sample_idle=True)
+    assert launcher.assignments == [("A01", 0)]
+
+
+def test_fatal_gpu_mapping_change_is_not_treated_as_transient(tmp_path):
+    class FatalPolicy(EligiblePolicy):
+        def observe(self, snapshots):
+            raise GpuMappingError("GPU UUID mapping changed")
+
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    events = []
+    dispatcher = Dispatcher(
+        queue,
+        state,
+        tmp_path,
+        StaticProbe(_eight_snapshots()),
+        FatalPolicy([]),
+        DispatcherLauncher(),
+        Descendants(),
+        MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "now",
+        event_logger=events.append,
+    )
+
+    with pytest.raises(GpuMappingError, match="UUID mapping"):
+        dispatcher.run_cycle(sample_idle=True)
+    assert events == []
+    assert state["leases"] == []
+
+
+def test_mixed_phase_a_terminal_results_allow_phase_b_dispatch(tmp_path):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    state["tasks"][0]["status"] = "failed"
+    state["tasks"][1]["status"] = "interrupted"
+    launcher = DispatcherLauncher()
+    dispatcher = Dispatcher(
+        queue,
+        state,
+        tmp_path,
+        StaticProbe(_eight_snapshots()),
+        EligiblePolicy([0]),
+        launcher,
+        Descendants(),
+        MemoryStore(),
+        sleeper=lambda seconds: None,
+        now=lambda: "now",
+    )
+
+    dispatcher.run_cycle(sample_idle=True)
+
+    assert launcher.assignments == [("B01", 0)]
+
+
 def test_foreign_pid_after_launch_is_logged_without_stopping_owned_task(tmp_path):
     queue = _queue()
     state = initial_state(queue, "run-1", "created")
@@ -805,7 +928,42 @@ def test_completed_queue_logs_completion_once(tmp_path):
 
     assert dispatcher.run_forever() == 0
 
-    assert events.count("QUEUE_COMPLETE") == 1
+    assert events == [
+        "QUEUE_COMPLETE total=4 succeeded=4 failed=0 "
+        "launch_failed=0 interrupted=0"
+    ]
+
+
+def test_partially_successful_queue_completes_without_sleeping(tmp_path):
+    queue = _queue()
+    state = initial_state(queue, "run-1", "created")
+    for task, status in zip(
+        state["tasks"],
+        ("succeeded", "failed", "launch_failed", "interrupted"),
+    ):
+        task["status"] = status
+    events = []
+    dispatcher = Dispatcher(
+        queue,
+        state,
+        tmp_path,
+        StaticProbe(_eight_snapshots()),
+        EligiblePolicy([]),
+        DispatcherLauncher(),
+        Descendants(),
+        MemoryStore(),
+        sleeper=lambda seconds: (_ for _ in ()).throw(
+            AssertionError("completed queue must not sleep")
+        ),
+        now=lambda: "now",
+        event_logger=events.append,
+    )
+
+    assert dispatcher.run_forever() == 0
+    assert events == [
+        "QUEUE_COMPLETE total=4 succeeded=1 failed=1 "
+        "launch_failed=1 interrupted=1"
+    ]
 
 
 def test_cli_requires_exactly_one_mode():

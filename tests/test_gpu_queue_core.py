@@ -6,6 +6,7 @@ from gpu_queue_core import (
     AtomicStateStore,
     PreflightError,
     GpuSnapshot,
+    GpuMappingError,
     IdlePolicy,
     MAX_GPU_LEASES,
     ProbeError,
@@ -227,7 +228,7 @@ def test_idle_policy_rejects_gpu_uuid_mapping_change():
     changed = list(_snapshots())
     changed[0] = GpuSnapshot(0, "GPU-changed", 0, 0, ())
 
-    with pytest.raises(ProbeError, match="UUID mapping"):
+    with pytest.raises(GpuMappingError, match="UUID mapping"):
         policy.observe(tuple(changed))
 
 

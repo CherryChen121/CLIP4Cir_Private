@@ -34,6 +34,10 @@ class ProbeError(RuntimeError):
     pass
 
 
+class GpuMappingError(ProbeError):
+    pass
+
+
 class ResumeError(RuntimeError):
     pass
 
@@ -102,7 +106,7 @@ class IdlePolicy:
         if self._uuid_by_index is None:
             self._uuid_by_index = mapping
         elif mapping != self._uuid_by_index:
-            raise ProbeError("GPU UUID mapping changed")
+            raise GpuMappingError("GPU UUID mapping changed")
 
         eligible = []
         for index in self.expected_indices:
