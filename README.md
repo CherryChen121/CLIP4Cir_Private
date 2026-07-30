@@ -39,7 +39,7 @@ CLIP4Cir/
 │   └── fashionIQ/
 │       ├── tuned_clip_best.pt     # Fine-tuned CLIP checkpoint (RN50x4)
 │       └── RetiZero.pth           # Pre-trained RetiZero weights
-└── models/                        # Saved Combiner checkpoints per run
+└── outputs/                       # Generated training runs (Git-ignored)
 ```
 
 ---
@@ -194,7 +194,21 @@ CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py \
     --validation-frequency 5 > combiner_vitl14.log 2>&1 &
 ```
 
-Training folder names are now normalized by model tag (for example `vitb32` and `vitl14`) to avoid slash-related path issues, while `--clip-model-name` keeps the original OpenAI model string.
+Training outputs use a shared, slash-safe layout:
+
+```text
+outputs/<dataset>/<clip-finetune|combiner>/<model>/<run-id>/
+├── checkpoints/
+├── run_manifest.json
+├── training_hyperparameters.json
+├── train_metrics.csv
+└── validation_metrics.csv
+```
+
+Model components are normalized (`ViT-B/32` becomes `vit-b-32`) while
+`--clip-model-name` keeps the original model string. Both training entrypoints
+accept `--output-root`; relative overrides are resolved from the project root.
+Without an override, all new runs are written below `outputs/`.
 
 **RetiZero backbone:**
 
@@ -241,7 +255,7 @@ python src/validate.py \
    --dataset FashionIQ \
    --dress-types CH CO NM RB RCH UM \
    --combining-function combiner \
-   --combiner-path models/<combiner_run>/best_combiner.pth \
+   --combiner-path outputs/fashioniq/combiner/<model>/<run-id>/checkpoints/combiner.pt \
    --projection-dim 2560 \
    --hidden-dim 5120 \
    --clip-model-name RN50x4 \
@@ -251,10 +265,31 @@ python src/validate.py \
 
 # RetiZero backbone
 python src/validate_retizero_lora.py \
-    --model-paths models/<retizero_run>/best_acc_*.pth \
+    --model-paths outputs/fashioniq/clip-finetune/retizero/<run-id>/checkpoints/*.pt \
     --base-weight-path pretrained_models/fashionIQ/RetiZero.pth \
     --output-csv results_retizero.csv
 ```
+
+---
+
+## Legacy Output Migration
+
+The migration tool audits the legacy `models/` tree, validates checkpoint
+containers, computes SHA-256 hashes, and reports strict failures and exact
+duplicates. Dry run is the default and does not create or modify files:
+
+```bash
+PYTHONPATH=src python scripts/organize_model_outputs.py
+PYTHONPATH=src python scripts/organize_model_outputs.py --apply
+PYTHONPATH=src python scripts/organize_model_outputs.py --verify
+PYTHONPATH=src python scripts/organize_model_outputs.py --finalize
+```
+
+`--apply` is blocked while an old training process may still write to
+`models/`. It migrates through `outputs/.staging`, preserves per-run metadata,
+and replaces byte-identical checkpoints with hard links. `--finalize` first
+verifies every migrated hash and duplicate inode, then removes only an empty
+legacy source tree using guarded directory removal.
 
 ---
 
@@ -289,4 +324,3 @@ pip install transformers
 
 - **CLIP4Cir** (ACM TOMM 2023): Alberto Baldrati et al. — [https://github.com/ABaldrati/CLIP4Cir](https://github.com/ABaldrati/CLIP4Cir)
 - **RetiZero**: LooKing9218 et al. — [https://github.com/LooKing9218/RetiZero](https://github.com/LooKing9218/RetiZero)
-

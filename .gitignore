@@ -276,7 +276,7 @@ fashionIQ_dataset
 *.h5
 *.ckpt
 pretrained_models/
-models/
+outputs/
 
 # --- Python 垃圾文件 ---
 __pycache__/

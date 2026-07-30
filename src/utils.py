@@ -144,7 +144,7 @@ def set_train_bar_description(train_bar, epoch: int, num_epochs: int, train_runn
 
 
 def save_model(name: str, cur_epoch: int, model_to_save: nn.Module, training_path: Path):
-    models_path = training_path / "saved_models"
+    models_path = training_path / "checkpoints"
     models_path.mkdir(exist_ok=True, parents=True)
     
     # 去掉 DataParallel 层（如果有的话）
