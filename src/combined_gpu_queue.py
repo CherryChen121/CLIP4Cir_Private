@@ -44,7 +44,8 @@ try:
     )
     from gpu_queue_audit import (
         format_gpu_audit,
-        format_queue_pause,
+        format_lease_event,
+        format_queue_complete,
         format_task_end,
         format_task_start,
     )
@@ -77,7 +78,8 @@ except ImportError:
     )
     from src.gpu_queue_audit import (
         format_gpu_audit,
-        format_queue_pause,
+        format_lease_event,
+        format_queue_complete,
         format_task_end,
         format_task_start,
     )
@@ -338,10 +340,6 @@ class Dispatcher:
     def _save(self):
         self.state_store.save(self.state)
 
-    def _log_pause_if_new(self, was_paused: bool) -> None:
-        if not was_paused and self.state.get("paused_reason"):
-            self.event_logger(format_queue_pause(self.state["paused_reason"]))
-
     def _log_probe_error(self, exc: Exception) -> None:
         detail = "_".join(str(exc).split()) or "unknown"
         self.event_logger(f"GPU_PROBE_ERROR detail={detail}")
@@ -370,12 +368,7 @@ class Dispatcher:
                 )
                 self._save()
                 self.event_logger(format_task_end(task))
-                self.event_logger(
-                    f"GPU_LEASE_COOLDOWN gpu={lease['gpu_index']} "
-                    f"gpu_uuid={lease['gpu_uuid']} "
-                    f"previous_task={lease['previous_task_id']} "
-                    f"cooldown_ready_at={lease['cooldown_ready_at']}"
-                )
+                self.event_logger(format_lease_event("GPU_LEASE_COOLDOWN", lease))
 
     @staticmethod
     def _gpu(snapshots: Tuple[GpuSnapshot, ...], index: int) -> Optional[GpuSnapshot]:
@@ -416,8 +409,11 @@ class Dispatcher:
         if save:
             self._save()
         self.event_logger(
-            f"GPU_LEASE_RELEASED gpu={released['gpu_index']} "
-            f"gpu_uuid={released['gpu_uuid']} reason={reason}"
+            format_lease_event(
+                "GPU_LEASE_RELEASED",
+                released,
+                reason=reason,
+            )
         )
 
     def _dispatch_on_gpu(
@@ -474,9 +470,7 @@ class Dispatcher:
             lease = acquire_lease(self.state, gpu, spec.task_id, self.now())
             event = "GPU_LEASE_ACQUIRED"
         self._save()
-        self.event_logger(
-            f"{event} gpu={gpu.index} gpu_uuid={gpu.uuid} task={spec.task_id}"
-        )
+        self.event_logger(format_lease_event(event, lease))
         self.event_logger(format_task_start(pending))
         return True
 
@@ -538,6 +532,9 @@ class Dispatcher:
                     idle_now=self.idle_policy.is_idle_now(snapshot),
                     idle_streak=self.idle_policy.idle_streak(snapshot.uuid),
                     running_task=task,
+                    lease=lease_for_gpu(self.state, snapshot.index),
+                    active_lease_count=len(self.state.get("leases", [])),
+                    max_gpu_leases=self.max_gpu_leases,
                     owned_compute_pids=owned_compute_pids,
                     owner_lookup=self.owner_lookup,
                 )
@@ -616,14 +613,7 @@ class Dispatcher:
                     self._save()
                 if not self._completion_logged:
                     summary = terminal_summary(self.state)
-                    self.event_logger(
-                        "QUEUE_COMPLETE "
-                        f"total={summary['total']} "
-                        f"succeeded={summary['succeeded']} "
-                        f"failed={summary['failed']} "
-                        f"launch_failed={summary['launch_failed']} "
-                        f"interrupted={summary['interrupted']}"
-                    )
+                    self.event_logger(format_queue_complete(summary))
                     self._completion_logged = True
                 return 0
             self.run_cycle(sample_idle=(cycle % 2 == 0))
