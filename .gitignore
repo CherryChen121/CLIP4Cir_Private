@@ -277,6 +277,8 @@ fashionIQ_dataset
 *.ckpt
 pretrained_models/
 outputs/
+src/clip_modules/modeling/timm_models/models/
+src/iden_modules/modeling/timm_models/models/
 
 # --- Python 垃圾文件 ---
 __pycache__/

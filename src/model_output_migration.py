@@ -286,8 +286,8 @@ def _classify_run(
     if nonempty_metrics:
         return replace(
             run,
-            classification="unresolved",
-            reasons=("nonempty-metrics-without-checkpoint",),
+            classification="valid",
+            reasons=("metrics-only-retained",),
         )
 
     if age_seconds < 24 * 60 * 60:
@@ -465,6 +465,14 @@ def _tree_size(path: Path) -> int:
     )
 
 
+def _legacy_report_destination(
+    scan: ScanResult,
+    report: Path,
+) -> Path:
+    relative = report.relative_to(scan.source_root)
+    return scan.output_root / "reports" / "legacy" / relative
+
+
 def build_migration_plan(scan: ScanResult) -> MigrationPlan:
     actions = []
     logical_bytes = 0
@@ -527,7 +535,7 @@ def build_migration_plan(scan: ScanResult) -> MigrationPlan:
 
     for report in scan.reports:
         snapshot = _snapshot(report)
-        destination = scan.output_root / "reports" / "legacy" / report.name
+        destination = _legacy_report_destination(scan, report)
         status = "error" if destination.exists() else "planned-move"
         actions.append(
             MigrationAction(
@@ -1081,7 +1089,10 @@ def apply_migration(plan: MigrationPlan) -> MigrationPlan:
         for action in plan.actions:
             if action.kind != "report" or action.destination is None:
                 continue
-            staged = staging_root / "reports" / action.source.name
+            staged = (
+                staging_root
+                / action.destination.relative_to(output_root)
+            )
             staged.parent.mkdir(parents=True, exist_ok=True)
             action.source.replace(staged)
             report_locations[action.source] = staged

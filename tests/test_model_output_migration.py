@@ -120,7 +120,22 @@ def test_recent_empty_run_is_not_failed(tmp_path):
     assert "modified-within-24-hours" in result.runs[0].reasons
 
 
-def test_live_pid_and_nonempty_metrics_each_prevent_failure(tmp_path):
+def test_metrics_only_run_is_retained_as_valid(tmp_path):
+    source = tmp_path / "models"
+    output = tmp_path / "outputs"
+    run = source / "clip_finetuned_on_fiq_RN50x4_2026-01-01_00:00:00_000001"
+    _write(run / "training_hyperparameters.json", b"{}")
+    metrics = _write(run / "train_metrics.csv", b"epoch,loss\n1,0.5\n")
+
+    scan = _scan(source, output)
+
+    assert scan.runs[0].classification == "valid"
+    assert scan.runs[0].reasons == ("metrics-only-retained",)
+    plan = build_migration_plan(scan)
+    assert any(action.source == metrics for action in plan.actions)
+
+
+def test_live_pid_is_active_and_nonempty_metrics_are_retained(tmp_path):
     source = tmp_path / "models"
     live = source / "combiner_trained_on_fiq_RN50x4_2026-01-01_00:00:00_pid9"
     metrics = source / "combiner_trained_on_fiq_RN50x4_2026-01-02_00:00:00_pid10"
@@ -134,8 +149,8 @@ def test_live_pid_and_nonempty_metrics_each_prevent_failure(tmp_path):
 
     by_pid = {run.pid: run for run in result.runs}
     assert by_pid[9].classification == "active"
-    assert by_pid[10].classification == "unresolved"
-    assert "nonempty-metrics-without-checkpoint" in by_pid[10].reasons
+    assert by_pid[10].classification == "valid"
+    assert by_pid[10].reasons == ("metrics-only-retained",)
 
 
 def test_any_legacy_writer_marks_empty_runs_active(tmp_path):
@@ -168,6 +183,47 @@ def test_xlsx_outside_run_is_classified_as_legacy_report(tmp_path):
 
     assert result.reports == (report,)
     assert result.unknown_paths == ()
+
+
+def test_same_named_legacy_reports_keep_relative_paths(tmp_path):
+    source = tmp_path / "models"
+    output = tmp_path / "outputs"
+    clip_report = _write(
+        source / "clip_finetuned_on_fiq_ViT-B/summary.xlsx",
+        b"clip",
+    )
+    combiner_report = _write(
+        source / "combiner_trained_on_fiq_ViT-B/summary.xlsx",
+        b"combiner",
+    )
+
+    plan = build_migration_plan(_scan(source, output))
+    report_actions = {
+        action.source: action
+        for action in plan.actions
+        if action.kind == "report"
+    }
+
+    assert report_actions[clip_report].destination == (
+        output / "reports/legacy/clip_finetuned_on_fiq_ViT-B/summary.xlsx"
+    )
+    assert report_actions[combiner_report].destination == (
+        output / "reports/legacy/combiner_trained_on_fiq_ViT-B/summary.xlsx"
+    )
+    assert all(
+        action.status == "planned-move"
+        for action in report_actions.values()
+    )
+
+    apply_migration(plan)
+
+    assert not clip_report.exists()
+    assert not combiner_report.exists()
+    assert report_actions[clip_report].destination.read_bytes() == b"clip"
+    assert (
+        report_actions[combiner_report].destination.read_bytes()
+        == b"combiner"
+    )
 
 
 def test_nonempty_corrupt_checkpoint_is_unresolved(tmp_path):

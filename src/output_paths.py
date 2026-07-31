@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 
 VALID_STAGES = frozenset({"clip-finetune", "combiner"})
@@ -47,8 +47,12 @@ def create_run_layout(
     project_root: Path,
     output_root: Optional[Union[str, Path]],
     dataset: str,
+    dataset_format: str,
     stage: str,
     model_name: str,
+    dataset_root_requested: Optional[str] = None,
+    dataset_root_resolved: Optional[str] = None,
+    dataset_classification_evidence: Sequence[str] = (),
     started_at: Optional[datetime] = None,
     pid: Optional[int] = None,
 ) -> RunLayout:
@@ -76,8 +80,14 @@ def create_run_layout(
     manifest = root / "run_manifest.json"
     temporary_manifest = root / ".run_manifest.json.tmp"
     payload = {
-        "dataset": dataset,
+        "dataset": dataset_slug,
         "dataset_slug": dataset_slug,
+        "dataset_format": slugify_component(dataset_format),
+        "dataset_root_requested": dataset_root_requested,
+        "dataset_root_resolved": dataset_root_resolved,
+        "dataset_classification_evidence": list(
+            dataset_classification_evidence
+        ),
         "training_stage": stage,
         "model_name": model_name,
         "model_slug": model_slug,

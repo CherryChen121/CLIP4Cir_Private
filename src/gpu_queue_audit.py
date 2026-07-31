@@ -24,18 +24,70 @@ def _owners(pids: Iterable[int], owner_lookup: Callable[[int], str]) -> str:
     return _csv(owners)
 
 
+def _timestamp(epoch: object) -> str:
+    try:
+        return datetime.fromtimestamp(float(epoch)).astimezone().strftime(
+            "%Y-%m-%dT%H:%M:%S%z"
+        )
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "-"
+
+
+def format_lease_event(event: str, lease: dict, *, reason: Optional[str] = None) -> str:
+    fields = [
+        event,
+        f"gpu={lease['gpu_index']}",
+        f"gpu_uuid={lease['gpu_uuid']}",
+    ]
+    if event in {"GPU_LEASE_ACQUIRED", "GPU_LEASE_REUSED"}:
+        fields.append(f"task={lease.get('task_id') or '-'}")
+    if event == "GPU_LEASE_COOLDOWN":
+        fields.extend(
+            (
+                f"previous_task={lease.get('previous_task_id') or '-'}",
+                f"cooldown_ready_at={_timestamp(lease.get('cooldown_ready_at'))}",
+            )
+        )
+    if event == "GPU_LEASE_RELEASED":
+        if not reason:
+            raise ValueError("GPU_LEASE_RELEASED requires a reason")
+        fields.append(f"reason={_single_line(reason)}")
+    return " ".join(fields)
+
+
+def format_queue_complete(summary: dict) -> str:
+    return (
+        f"QUEUE_COMPLETE total={summary['total']} "
+        f"succeeded={summary['succeeded']} failed={summary['failed']} "
+        f"launch_failed={summary['launch_failed']} "
+        f"interrupted={summary['interrupted']}"
+    )
+
+
 def format_gpu_audit(
     snapshot: GpuSnapshot,
     *,
     idle_now: bool,
     idle_streak: int,
     running_task: Optional[dict],
+    lease: Optional[dict],
+    active_lease_count: int,
+    max_gpu_leases: int,
     owned_compute_pids: Iterable[int],
     owner_lookup: Callable[[int], str],
 ) -> str:
+    lease_state = str(lease["state"]).upper() if lease is not None else "NONE"
+    lease_detail = (
+        f"leases={active_lease_count}/{max_gpu_leases} lease={lease_state}"
+    )
+    if lease is not None and lease.get("state") == "cooldown":
+        lease_detail += (
+            f" previous_task={lease.get('previous_task_id') or '-'}"
+            f" cooldown_ready_at={_timestamp(lease.get('cooldown_ready_at'))}"
+        )
     prefix = (
         f"GPU_AUDIT gpu={snapshot.index} uuid={snapshot.uuid} "
-        f"status={{status}} memory_mib={snapshot.memory_used_mib} "
+        f"{lease_detail} status={{status}} memory_mib={snapshot.memory_used_mib} "
         f"util_percent={snapshot.utilization_percent}"
     )
     compute_pids = tuple(sorted(set(snapshot.compute_pids)))

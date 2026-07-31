@@ -21,8 +21,19 @@ from tqdm import tqdm
 from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
 
-from data_utils import base_path, squarepad_transform, FashionIQDataset, targetpad_transform, CIRRDataset, SquarePad, TargetPad, ToClipTensor
+from data_utils import (
+    base_path,
+    squarepad_transform,
+    FashionIQDataset,
+    targetpad_transform,
+    CIRRDataset,
+    SquarePad,
+    TargetPad,
+    ToClipTensor,
+    resolve_fashioniq_root,
+)
 from combiner import Combiner
+from dataset_identity import resolve_fashioniq_training_identity
 from output_paths import create_run_layout
 from utils import collate_fn, update_train_running_results, set_train_bar_description, save_model, \
     extract_index_features, generate_randomized_fiq_caption, device
@@ -248,12 +259,23 @@ def combiner_training_fiq(train_dress_types: List[str], val_dress_types: List[st
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    identity = resolve_fashioniq_training_identity(
+        project_root=base_path,
+        dress_types=train_dress_types,
+        dataset_root=kwargs.get("fashioniq_root"),
+        output_dataset=kwargs.get("output_dataset"),
+        root_resolver=resolve_fashioniq_root,
+    )
+    kwargs["fashioniq_root"] = identity.root_resolved
+    if "training_hyper_params" in globals():
+        training_hyper_params["fashioniq_root"] = identity.root_resolved
+
     layout = create_run_layout(
         project_root=base_path,
         output_root=kwargs.get("output_root"),
-        dataset="fashioniq",
         stage="combiner",
         model_name=clip_model_name,
+        **identity.layout_fields(),
     )
     training_path = layout.root
 
@@ -789,6 +811,7 @@ def combiner_training_cirr(projection_dim: int, hidden_dim: int, num_epochs: int
         project_root=base_path,
         output_root=kwargs.get("output_root"),
         dataset="cirr",
+        dataset_format="cirr",
         stage="combiner",
         model_name=clip_model_name,
     )
@@ -1040,6 +1063,15 @@ if __name__ == '__main__':
         default=None,
         help="Training output root; relative paths are resolved from the project root",
     )
+    parser.add_argument(
+        "--output-dataset",
+        type=str,
+        default=None,
+        help=(
+            "Actual dataset name for output paths; overrides root/category "
+            "auto-detection"
+        ),
+    )
     parser.add_argument("--projection-dim", default=640 * 4, type=int, help='Combiner projection dim')
     parser.add_argument("--hidden-dim", default=640 * 8, type=int, help="Combiner hidden dim")
     parser.add_argument("--num-epochs", default=300, type=int, help="number training epochs")
@@ -1113,6 +1145,7 @@ if __name__ == '__main__':
         "clip_model_path": args.clip_model_path,
         "fashioniq_root": args.fashioniq_root,
         "output_root": args.output_root,
+        "output_dataset": args.output_dataset,
         "combiner_lr": args.combiner_lr,
         "weight_decay": args.weight_decay,
         "max_grad_norm": args.max_grad_norm,

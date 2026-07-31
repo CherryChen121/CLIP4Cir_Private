@@ -194,10 +194,10 @@ CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 nohup python src/combiner_train.py \
     --validation-frequency 5 > combiner_vitl14.log 2>&1 &
 ```
 
-Training outputs use a shared, slash-safe layout:
+Training outputs use the actual dataset identity rather than the loader format:
 
 ```text
-outputs/<dataset>/<clip-finetune|combiner>/<model>/<run-id>/
+outputs/<actual-dataset>/<clip-finetune|combiner>/<model>/<run-id>/
 ├── checkpoints/
 ├── run_manifest.json
 ├── training_hyperparameters.json
@@ -205,10 +205,42 @@ outputs/<dataset>/<clip-finetune|combiner>/<model>/<run-id>/
 └── validation_metrics.csv
 ```
 
-Model components are normalized (`ViT-B/32` becomes `vit-b-32`) while
-`--clip-model-name` keeps the original model string. Both training entrypoints
-accept `--output-root`; relative overrides are resolved from the project root.
-Without an override, all new runs are written below `outputs/`.
+The built-in actual dataset slugs are `idrid`, `uwf`,
+`combined-fundus-cir`, and `fashioniq`. FashionIQ remains the data-loader
+format, recorded as `dataset_format: fashioniq` in each run manifest. Model
+components are normalized (`ViT-B/32` becomes `vit-b-32`) while
+`--clip-model-name` keeps the original model string.
+
+Both training entrypoints accept `--output-root`; relative overrides are
+resolved from the project root. They also accept `--output-dataset` as an
+explicit actual-dataset override. Without that override, the resolved
+FashionIQ root and category set determine the actual dataset. Conflicting or
+unknown evidence stops before creating a run directory.
+
+For example, Combined Fundus CIR training is written below
+`outputs/combined-fundus-cir/`:
+
+```bash
+python src/combiner_train.py \
+    --dataset FashionIQ \
+    --fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset \
+    --dress-types Internal \
+    --clip-model-name ViT-L/14
+```
+
+For a custom FashionIQ-format dataset, name its output explicitly:
+
+```bash
+python src/clip_fine_tune.py \
+    --dataset FashionIQ \
+    --fashioniq-root /path/to/custom-fashioniq-format-data \
+    --dress-types custom \
+    --output-dataset my-study
+```
+
+`run_manifest.json` records the requested root, its resolved target, and the
+classification evidence, so changing a project symlink later does not change
+the historical dataset identity.
 
 **RetiZero backbone:**
 
@@ -247,15 +279,35 @@ RetiZero is a fundus-specific vision-language model pre-trained on 341,896 fundu
 
 ## Validation
 
-Compute Recall@1 and Recall@10 per category and overall average recall:
+Validation results use the same actual-dataset-first organization as training:
+
+```text
+outputs/<actual-dataset>/evaluation/<model>/<run-id>/
+├── evaluation_manifest.json
+├── evaluation_metrics.json
+├── evaluation_metrics.csv
+└── evaluation.log
+```
+
+The manifest records the physical dataset root, classification evidence,
+model/checkpoint inputs, split, categories, complete CLI arguments, and final
+status. A successful run contains both JSON and spreadsheet-friendly CSV
+metrics. An allocated failed run retains its manifest and log but does not
+publish final metric files.
+
+Compute Recall@1, Recall@5, and Recall@10 per category and overall averages:
 
 ```bash
 # CLIP backbone
 python src/validate.py \
    --dataset FashionIQ \
+   --fashioniq-root /data0/qrchen/datasets/UWF_CIR_Dataset_cold \
    --dress-types CH CO NM RB RCH UM \
+   --fashioniq-split val \
+   --output-dataset uwf \
+   --evaluation-name uwf-val \
    --combining-function combiner \
-   --combiner-path outputs/fashioniq/combiner/<model>/<run-id>/checkpoints/combiner.pt \
+   --combiner-path outputs/uwf/combiner/<model>/<run-id>/checkpoints/combiner.pt \
    --projection-dim 2560 \
    --hidden-dim 5120 \
    --clip-model-name RN50x4 \
@@ -265,10 +317,21 @@ python src/validate.py \
 
 # RetiZero backbone
 python src/validate_retizero_lora.py \
-    --model-paths outputs/fashioniq/clip-finetune/retizero/<run-id>/checkpoints/*.pt \
+    --model-paths outputs/uwf/clip-finetune/retizero/<run-id>/checkpoints/*.pt \
     --base-weight-path pretrained_models/fashionIQ/RetiZero.pth \
-    --output-csv results_retizero.csv
+    --fashioniq-root /data0/qrchen/datasets/UWF_CIR_Dataset_cold \
+    --dress-types CH CO NM RB RCH UM \
+    --fashioniq-split val \
+    --output-dataset uwf \
+    --evaluation-name retizero-uwf-val \
+    --output-csv evaluation_metrics.csv
 ```
+
+Both scripts default `--output-root` to the project `outputs/` directory and
+accept `--output-dataset` when the actual dataset should be explicit.
+`validate_retizero_lora.py --output-csv` accepts only a filename within the
+allocated evaluation run; absolute paths and directory components are
+rejected.
 
 ---
 
@@ -285,11 +348,29 @@ PYTHONPATH=src python scripts/organize_model_outputs.py --verify
 PYTHONPATH=src python scripts/organize_model_outputs.py --finalize
 ```
 
-`--apply` is blocked while an old training process may still write to
-`models/`. It migrates through `outputs/.staging`, preserves per-run metadata,
-and replaces byte-identical checkpoints with hard links. `--finalize` first
-verifies every migrated hash and duplicate inode, then removes only an empty
-legacy source tree using guarded directory removal.
+This historical migration is complete. Its retained audit is
+`outputs/migration_manifest.csv` and `outputs/migration_report.json`. New
+training does not generate `outputs/reports/legacy/`.
+
+### Reclassify FashionIQ-format outputs by actual dataset
+
+The dataset reclassification workflow moves whole run directories using
+same-filesystem renames and verifies ordinary files by size and SHA-256.
+Dry-run is the default:
+
+```bash
+PYTHONPATH=src python scripts/reclassify_output_datasets.py
+PYTHONPATH=src python scripts/reclassify_output_datasets.py --apply
+PYTHONPATH=src python scripts/reclassify_output_datasets.py --verify
+PYTHONPATH=src python scripts/reclassify_output_datasets.py --finalize
+```
+
+`--apply` refuses active FashionIQ training, unresolved evidence, symlinks,
+source changes, cross-filesystem moves, and target collisions. It preserves
+the five audited legacy Excel reports until an independent applied-state
+verification succeeds. `--finalize` then removes exactly those five reports,
+marks their audit rows `deleted-approved-report`, and removes only verified
+empty `reports/`, `fashioniq/`, and transaction staging directories.
 
 ---
 
