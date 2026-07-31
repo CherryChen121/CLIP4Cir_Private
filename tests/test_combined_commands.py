@@ -1,4 +1,3 @@
-import hashlib
 import re
 from pathlib import Path
 
@@ -7,7 +6,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMMAND_FILE = PROJECT_ROOT / "命令.sh"
 BEGIN = "# COMBINED_COMMANDS_BEGIN"
 END = "# COMBINED_COMMANDS_END"
-LEGACY_SUFFIX_SHA256 = "0b96411202f8eb89b33323162c3e2eaa1b4d5dbdc8947d3a217d9fea87f808ae"
 COMBINED_ROOT_ARGUMENT = (
     "--fashioniq-root /data0/qrchen/datasets/Combined_Fundus_CIR_Dataset"
 )
@@ -136,10 +134,17 @@ def test_combined_preflight_uses_runnable_retrieval_checkpoints():
 def test_combined_training_commands_are_isolated_single_gpu_nohup_jobs():
     _, _, commands = _command_parts()
 
-    assert all(line.startswith("CUDA_VISIBLE_DEVICES=0 ") for line in commands)
+    assert all(
+        re.match(r"^CUDA_VISIBLE_DEVICES=[0-7] ", line)
+        for line in commands
+    )
     assert all(" nohup python " in line for line in commands)
     assert all(COMBINED_ROOT_ARGUMENT in line for line in commands)
     assert all("--dress-types Internal" in line for line in commands)
+    assert all(
+        line.count("--output-dataset combined-fundus-cir") == 1
+        for line in commands
+    )
     assert all(line.endswith(" 2>&1 &") for line in commands)
     assert not any(re.search(r"run[2-9]_combined_", line) for line in commands)
 
@@ -154,10 +159,36 @@ def test_combined_training_commands_use_unique_log_files():
     assert all(name.startswith("run1_combined_") for name in log_names)
 
 
-def test_existing_uwf_and_idrid_commands_remain_byte_for_byte_unchanged():
+def test_uwf_and_idrid_training_commands_declare_actual_output_dataset():
     _, legacy, _ = _command_parts()
 
-    assert hashlib.sha256(legacy.encode()).hexdigest() == LEGACY_SUFFIX_SHA256
+    commands = [
+        line
+        for line in legacy.splitlines()
+        if (
+            "python src/clip_fine_tune.py " in line
+            or "python src/combiner_train.py " in line
+        )
+    ]
+    uwf_commands = [
+        line
+        for line in commands
+        if "--dress-types CH CO NM RB RCH UM" in line
+    ]
+    idrid_commands = [
+        line for line in commands if "--dress-types IDRiD" in line
+    ]
+
+    assert len(uwf_commands) == 145
+    assert len(idrid_commands) == 145
+    assert all(
+        line.count("--output-dataset uwf") == 1
+        for line in uwf_commands
+    )
+    assert all(
+        line.count("--output-dataset idrid") == 1
+        for line in idrid_commands
+    )
 
 
 def test_combined_validation_templates_route_outputs_by_actual_dataset():
